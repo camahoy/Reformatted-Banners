@@ -71,6 +71,22 @@ def detect_format(sheet_df):
     """
     raw = sheet_df.values.tolist()
 
+    # fmt5: question at row 3, categories at row 5, two base rows (unweighted + weighted)
+    # Signature: row 3 col 0 has question wording, row 4 col 1 has 'Total',
+    #            row 5 col 1 has category names
+    try:
+        row3_col0 = raw[3][0]
+        row4_col1 = raw[4][1]
+        row5_col1 = raw[5][1]
+        if (
+            isinstance(row3_col0, str) and len(row3_col0.strip()) > 5
+            and isinstance(row4_col1, str) and 'total' in row4_col1.lower()
+            and isinstance(row5_col1, str) and row5_col1.strip()
+        ):
+            return 'fmt5'
+    except (IndexError, TypeError):
+        pass
+
     # fmt4: brands as columns — row 3 col 1 blank, row 4 col 1 is a brand name not 'Total'
     try:
         row3_col1 = raw[3][1]
@@ -140,6 +156,12 @@ def scan_file(file_bytes):
                     s = sublabel_row[j] if j < len(sublabel_row) else ''
                     if isinstance(g, str) and g.strip():
                         columns.append((g.strip(), s.strip() if isinstance(s, str) else ''))
+            elif fmt == 'fmt5':
+                cat_row = raw[5] if len(raw) > 5 else []
+                for j in range(1, len(cat_row)):
+                    g = cat_row[j]
+                    if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
+                        columns.append((g.strip(), ''))
             elif fmt == 'fmt4':
                 brand_row = raw[4] if len(raw) > 4 else []
                 for j in range(1, len(brand_row)):
@@ -168,12 +190,12 @@ def scan_file(file_bytes):
 def get_all_columns(sheet_metas):
     """
     Return deduplicated list of (group, sublabel) column tuples
-    from fmt2/fmt3 sheets only (not fmt4 — those use brand columns).
+    from fmt2/fmt3/fmt5 sheets (not fmt4 — those use brand columns).
     """
     seen = set()
     cols = []
     for s in sheet_metas:
-        if s['fmt'] in ('fmt2', 'fmt3'):
+        if s['fmt'] in ('fmt2', 'fmt3', 'fmt5'):
             for col in s['columns']:
                 if col[0] not in seen:
                     seen.add(col[0])
@@ -203,6 +225,19 @@ def scan_rows_for_sheets(file_bytes, sheet_indices):
                         break
                 start = (base_row_idx + 2) if base_row_idx is not None else 9
                 j = start
+                while j < len(raw):
+                    label = raw[j][0]
+                    if isinstance(label, str) and label.strip():
+                        clean = label.strip()
+                        if clean.lower() == 'sigma':
+                            break
+                        if clean not in seen:
+                            seen.add(clean)
+                            rows.append(clean)
+                    j += 3
+            elif fmt == 'fmt5':
+                # fmt5 data starts at row 12
+                j = 12
                 while j < len(raw):
                     label = raw[j][0]
                     if isinstance(label, str) and label.strip():
@@ -442,6 +477,86 @@ def parse_fmt4_sheet(sheet_df):
     return {
         'question_wording': question_wording,
         'brands':           brands,
+        'base_values':      base_values,
+        'answers':          answers,
+        'data':             data,
+    }
+
+
+def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False):
+    """
+    Parses the variant banner format where:
+      Row 0  : project ID
+      Row 1  : weight note
+      Row 2  : banner/sample label
+      Row 3  : question wording  (col 0)
+      Row 4  : group names       (col 1+ — e.g. 'Total', blank...)
+      Row 5  : category names    (col 1+ — e.g. 'Total','Gen Z','Male','Female'...)
+      Row 6  : letter codes
+      Row 7  : blank
+      Row 8  : Unweighted Base + counts (same row)
+      Row 9  : blank
+      Row 10 : Base: Total Answering + weighted counts (same row)
+      Row 11 : blank
+      Row 12+: answer label + count (same row), % on next row, stat sig after
+               every 3 rows, ends at 'Sigma'
+    """
+    raw = sheet_df.values.tolist()
+
+    question_wording = str(raw[3][0]).strip() if (len(raw) > 3 and raw[3][0]) else ''
+
+    # Categories are in row 5 (col 1+)
+    cat_row = raw[5] if len(raw) > 5 else []
+    all_cols = []
+    for j in range(1, len(cat_row)):
+        g = cat_row[j]
+        if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
+            all_cols.append((j, g.strip(), ''))
+
+    if desired_groups is not None:
+        desired_lower = {d.lower() for d in desired_groups}
+        selected_cols = [(j, g, s) for (j, g, s) in all_cols if g.lower() in desired_lower]
+    else:
+        selected_cols = all_cols  # include all by default
+
+    col_indices = [j for (j, g, s) in selected_cols]
+    col_labels  = [(g, s) for (j, g, s) in selected_cols]
+
+    # Base values:
+    # Row 8  = Unweighted Base
+    # Row 10 = Base: Total Answering (weighted)
+    # Use weighted if weighted_data=True, else unweighted
+    base_row_idx = 10 if weighted_data else 8
+    base_row     = raw[base_row_idx] if len(raw) > base_row_idx else []
+    base_values  = [base_row[j] if j < len(base_row) else None for j in col_indices]
+
+    # Answers start at row 12, every 3 rows
+    answers = []
+    data    = []
+    i = 12
+    while i < len(raw):
+        label = raw[i][0]
+        if isinstance(label, str) and label.strip():
+            label_clean = label.strip()
+            if label_clean.lower() == 'sigma':
+                break
+            answers.append(label_clean)
+            pct_row  = raw[i + 1] if i + 1 < len(raw) else []
+            row_vals = []
+            for j in col_indices:
+                v = pct_row[j] if j < len(pct_row) else None
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    row_vals.append(None)
+                elif isinstance(v, str) and v.strip() in ('-', '', '\xa0'):
+                    row_vals.append(None)
+                else:
+                    row_vals.append(v)
+            data.append(row_vals)
+        i += 3
+
+    return {
+        'question_wording': question_wording,
+        'columns':          col_labels,
         'base_values':      base_values,
         'answers':          answers,
         'data':             data,
@@ -709,7 +824,31 @@ def generate_outputs(
                     write_xl(parsed['question_wording'], col_labels,
                              parsed['base_values'], answers, data, 100, xl_sheet_key)
 
-            # ── fmt3 ─────────────────────────────────────────
+            # ── fmt5 ─────────────────────────────────────────
+            elif fmt == 'fmt5':
+                parsed = parse_fmt5_sheet(sheet_df, desired_groups, weighted_data)
+                if not parsed['answers']:
+                    skipped.append(sheet_label)
+                    continue
+
+                col_labels = [g for (g, s) in parsed['columns']]
+                answers, data = apply_row_filter(parsed["answers"], parsed["data"], row_filter)
+
+                if not answers:
+                    skipped.append(sheet_label)
+                    continue
+
+                if word_doc is not None:
+                    write_table_to_doc(
+                        word_doc, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, first_word,
+                    )
+                    first_word = False
+
+                if xl_wb is not None:
+                    write_xl(parsed['question_wording'], col_labels,
+                             parsed['base_values'], answers, data, 100, xl_sheet_key)
             elif fmt == 'fmt3':
                 parsed     = parse_fmt3_sheet(sheet_df, desired_groups)
                 if not parsed['answers']:
@@ -872,6 +1011,348 @@ def generate_outputs(
         progress_callback(1.0, "Finalizing…")
 
     # Serialize outputs
+    word_bytes  = None
+    excel_bytes = None
+
+    if word_doc is not None and output_format in ('word', 'both'):
+        buf = io.BytesIO()
+        word_doc.save(buf)
+        word_bytes = buf.getvalue()
+
+    if xl_wb is not None and output_format in ('excel', 'both'):
+        buf = io.BytesIO()
+        xl_wb.save(buf)
+        excel_bytes = buf.getvalue()
+
+    return {
+        'word_bytes':  word_bytes,
+        'excel_bytes': excel_bytes,
+        'skipped':     skipped,
+        'errors':      errors,
+    }
+
+# ── Multi-source scanning ─────────────────────────────────────
+
+def scan_multi_source(file_list):
+    """
+    Scan multiple banner files and return a unified question index.
+    file_list: list of (file_bytes, banner_name) tuples.
+
+    Returns:
+      {
+        'banners': [
+            {'name': str, 'sheets': [meta...], 'all_cols': [...]}
+        ],
+        'matched':   [ {q_id, wording, banner_sheets: {banner_name: sheet_meta}} ],
+        'unmatched': [ {banner_name, sheet_meta} ]  # questions only in one banner
+      }
+    """
+    import re
+    import difflib
+
+    banners = []
+    for file_bytes, banner_name in file_list:
+        metas    = scan_file(file_bytes)
+        all_cols = get_all_columns(metas)
+        banners.append({'name': banner_name, 'sheets': metas,
+                        'all_cols': all_cols, 'file_bytes': file_bytes})
+
+    if not banners:
+        return {'banners': [], 'matched': [], 'unmatched': []}
+
+    def q_id(wording):
+        """Extract question ID prefix e.g. 'GO2', 'A0', 'S1'."""
+        m = re.match(r'^([A-Za-z]+\d+)', wording.strip())
+        return m.group(1).upper() if m else None
+
+    # Build index per banner: {q_id or wording_key → sheet_meta}
+    banner_indices = []
+    for b in banners:
+        idx = {}
+        for m in b['sheets']:
+            if m['fmt'] == 'error':
+                continue
+            qid = q_id(m['question_wording'])
+            key = qid if qid else m['question_wording'].strip()[:80]
+            # If duplicate key within same banner, append index
+            if key in idx:
+                key = f"{key}_{m['index']}"
+            idx[key] = m
+        banner_indices.append(idx)
+
+    # Match questions across all banners
+    # Start from banner 0 as the reference
+    ref_idx  = banner_indices[0]
+    matched  = []
+    unmatched = []
+
+    for key, ref_meta in ref_idx.items():
+        entry = {
+            'q_id':    key,
+            'wording': ref_meta['question_wording'],
+            'banner_sheets': {banners[0]['name']: ref_meta},
+        }
+        for bi in range(1, len(banners)):
+            other_idx = banner_indices[bi]
+            if key in other_idx:
+                entry['banner_sheets'][banners[bi]['name']] = other_idx[key]
+            else:
+                # Not found by ID — mark as None (user will map manually)
+                entry['banner_sheets'][banners[bi]['name']] = None
+        matched.append(entry)
+
+    # Find questions only in non-reference banners
+    for bi in range(1, len(banners)):
+        other_idx = banner_indices[bi]
+        for key, meta in other_idx.items():
+            if key not in ref_idx:
+                unmatched.append({'banner_name': banners[bi]['name'],
+                                  'q_id': key, 'sheet_meta': meta})
+
+    return {
+        'banners':   banners,
+        'matched':   matched,
+        'unmatched': unmatched,
+    }
+
+
+def generate_merged_outputs(
+    multi_source,          # result of scan_multi_source
+    matched_overrides,     # dict: {q_id → {banner_name: sheet_index|None}}
+                           # user-provided manual mappings for unmatched questions
+    selected_cols_per_banner,  # dict: {banner_name: [col_name, ...]}
+    output_format,
+    excel_mode,
+    portrait_landscape,
+    weighted_data,
+    row_filter,            # 'all' or list of row labels
+    progress_callback=None,
+):
+    """
+    Generates merged output for Scenario A (column merge, same wave).
+    For each matched question, columns from all banners are merged side by side.
+    """
+    banners  = multi_source['banners']
+    matched  = multi_source['matched']
+    skipped  = []
+    errors   = []
+
+    # Apply manual overrides to matched list
+    # Override format: {q_id: {banner_name: sheet_index or None}}
+    effective_matched = []
+    for entry in matched:
+        eff = dict(entry)
+        if entry['q_id'] in (matched_overrides or {}):
+            overrides = matched_overrides[entry['q_id']]
+            for bn, sheet_idx in overrides.items():
+                if sheet_idx is None:
+                    eff['banner_sheets'][bn] = None
+                else:
+                    # Find the sheet meta by index
+                    for b in banners:
+                        if b['name'] == bn:
+                            for m in b['sheets']:
+                                if m['index'] == sheet_idx:
+                                    eff['banner_sheets'][bn] = m
+        effective_matched.append(eff)
+
+    # Add unmatched questions that were manually mapped
+    for entry in multi_source.get('unmatched', []):
+        qid = entry['q_id']
+        if qid in (matched_overrides or {}):
+            overrides = matched_overrides[qid]
+            new_entry = {
+                'q_id':    qid,
+                'wording': entry['sheet_meta']['question_wording'],
+                'banner_sheets': {},
+            }
+            for b in banners:
+                new_entry['banner_sheets'][b['name']] = None
+            new_entry['banner_sheets'][entry['banner_name']] = entry['sheet_meta']
+            for bn, sheet_idx in overrides.items():
+                if sheet_idx is not None:
+                    for b in banners:
+                        if b['name'] == bn:
+                            for m in b['sheets']:
+                                if m['index'] == sheet_idx:
+                                    new_entry['banner_sheets'][bn] = m
+            effective_matched.append(new_entry)
+
+    # Word + Excel setup
+    word_doc = None
+    if output_format in ('word', 'both'):
+        try:
+            word_doc = _get_word_template(portrait_landscape)
+        except Exception:
+            word_doc = Document()
+        style = word_doc.styles['Normal']
+        style.font.name = 'Arial'
+        style.font.size = Pt(10)
+
+    xl_wb         = None
+    xl_sheet_ctr  = [0]
+    xl_sheet_rows = {}
+
+    if output_format in ('excel', 'both'):
+        xl_wb = openpyxl.Workbook()
+        xl_wb.remove(xl_wb.active)
+
+    def _xl_get_sheet(label):
+        name = label[:31]
+        if excel_mode == 'per_question':
+            if name not in xl_wb.sheetnames:
+                xl_wb.create_sheet(title=name)
+                xl_sheet_rows[name] = 1
+            return xl_wb[name], xl_sheet_rows.get(name, 1)
+        else:
+            xl_sheet_ctr[0] += 1
+            sname = f"{xl_sheet_ctr[0]:03d}_{name}"[:31]
+            return xl_wb.create_sheet(title=sname), 1
+
+    def _xl_done(ws, label, next_row):
+        if excel_mode == 'per_question':
+            xl_sheet_rows[label[:31]] = next_row
+
+    def _apply_row_filter(answers, data):
+        if row_filter == 'all' or not row_filter:
+            return answers, data
+        custom = {r.strip().lower() for r in row_filter}
+        fa, fd = [], []
+        for a, d in zip(answers, data):
+            if a.strip().lower() in custom:
+                fa.append(a)
+                fd.append(d)
+        return fa, fd
+
+    total     = max(len(effective_matched), 1)
+    first_doc = True
+
+    # File bytes lookup
+    bytes_map = {b['name']: b['file_bytes'] for b in banners}
+
+    for idx, entry in enumerate(effective_matched):
+        if progress_callback:
+            progress_callback(idx / total, f"Processing {entry['q_id']}…")
+
+        try:
+            q_id_key  = entry['q_id']
+            xl_key    = q_id_key[:31]
+
+            # Parse each banner's sheet for this question
+            merged_col_labels  = []
+            merged_base_values = []
+            merged_answers     = None   # use first banner's answers as reference
+            merged_data_cols   = []     # list of per-answer value lists, one per column
+
+            for b in banners:
+                bname      = b['name']
+                sheet_meta = entry['banner_sheets'].get(bname)
+                sel_cols   = selected_cols_per_banner.get(bname, [])
+
+                if sheet_meta is None or not sel_cols:
+                    # Banner doesn't have this question — add blank columns
+                    for col in sel_cols:
+                        merged_col_labels.append(col)
+                        merged_base_values.append(None)
+                        # Will fill with None per answer below
+                        merged_data_cols.append(None)  # sentinel
+                    continue
+
+                # Parse the sheet
+                fb  = bytes_map[bname]
+                xl  = pd.ExcelFile(io.BytesIO(fb))
+                df  = xl.parse(sheet_meta['index'], header=None, na_values=[''])
+                fmt = detect_format(df)
+
+                if fmt == 'fmt2':
+                    parsed = parse_fmt2_sheet(df, sel_cols, weighted_data)
+                elif fmt == 'fmt5':
+                    parsed = parse_fmt5_sheet(df, sel_cols, weighted_data)
+                else:
+                    # fmt3/fmt4 not merged in Scenario A for now
+                    skipped.append(f"{bname} — {sheet_meta['sheet_name']} (fmt not supported in merge)")
+                    for col in sel_cols:
+                        merged_col_labels.append(col)
+                        merged_base_values.append(None)
+                        merged_data_cols.append(None)
+                    continue
+
+                col_names = [g for (g, s) in parsed['columns']]
+                answers_b = parsed['answers']
+                data_b    = parsed['data']   # list of rows, each row = list of values per col
+
+                # Set reference answers from first banner
+                if merged_answers is None:
+                    merged_answers = answers_b
+
+                # Build answer → data lookup for this banner
+                ans_lookup = {}
+                for ai, ans in enumerate(answers_b):
+                    ans_lookup[ans.strip().lower()] = data_b[ai] if ai < len(data_b) else []
+
+                for ci, col_name in enumerate(col_names):
+                    merged_col_labels.append(col_name)
+                    merged_base_values.append(
+                        parsed['base_values'][ci] if ci < len(parsed['base_values']) else None
+                    )
+                    # Build column data aligned to merged_answers
+                    col_data = []
+                    for ans in (merged_answers or []):
+                        row = ans_lookup.get(ans.strip().lower())
+                        val = row[ci] if (row and ci < len(row)) else None
+                        col_data.append(val)
+                    merged_data_cols.append(col_data)
+
+            if not merged_answers:
+                skipped.append(q_id_key)
+                continue
+
+            # Fill None sentinel columns with blanks aligned to merged_answers
+            n_answers = len(merged_answers)
+            for ci in range(len(merged_data_cols)):
+                if merged_data_cols[ci] is None:
+                    merged_data_cols[ci] = [None] * n_answers
+
+            # Transpose: merged_data[answer_idx][col_idx]
+            merged_data = []
+            for ai in range(n_answers):
+                row = [merged_data_cols[ci][ai] if ai < len(merged_data_cols[ci])
+                       else None for ci in range(len(merged_col_labels))]
+                merged_data.append(row)
+
+            # Apply row filter
+            filtered_answers, filtered_data = _apply_row_filter(merged_answers, merged_data)
+            if not filtered_answers:
+                skipped.append(q_id_key)
+                continue
+
+            question_wording = entry['wording']
+
+            # Write to Word
+            if word_doc is not None:
+                write_table_to_doc(
+                    word_doc, question_wording,
+                    merged_col_labels, merged_base_values,
+                    filtered_answers, filtered_data, 100, first_doc,
+                )
+                first_doc = False
+
+            # Write to Excel
+            if xl_wb is not None:
+                ws, row_num = _xl_get_sheet(xl_key)
+                next_row = _xl_write_table(
+                    ws, row_num, question_wording,
+                    merged_col_labels, merged_base_values,
+                    filtered_answers, filtered_data, 100, True,
+                )
+                _xl_done(ws, xl_key, next_row)
+
+        except Exception as e:
+            errors.append((entry.get('wording', entry['q_id'])[:60], str(e)))
+
+    if progress_callback:
+        progress_callback(1.0, "Finalizing…")
+
     word_bytes  = None
     excel_bytes = None
 
