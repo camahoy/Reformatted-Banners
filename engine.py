@@ -656,12 +656,24 @@ def generate_outputs(
 
     first_word = True
 
-    for idx, (sheet_idx, row_filter) in enumerate(sheet_table_configs):
+    for idx, config_tuple in enumerate(sheet_table_configs):
+        # Support both old (sheet_idx, row_filter) and new (sheet_idx, row_filter, prefix, label)
+        if len(config_tuple) == 4:
+            sheet_idx, row_filter, group_prefix, table_label = config_tuple
+        else:
+            sheet_idx, row_filter = config_tuple
+            group_prefix = None
+            table_label  = None
+
         if progress_callback:
             progress_callback(idx / total, f"Processing sheet {sheet_idx}…")
 
+        # Excel sheet key: use group_prefix in per_question mode so all
+        # sub-questions in a group land on the same sheet
+        xl_sheet_key = (group_prefix or xl.sheet_names[sheet_idx])[:31]
+
         try:
-            sheet_name = xl.sheet_names[sheet_idx]
+            sheet_name  = xl.sheet_names[sheet_idx]
             sheet_label = sheet_name[:31]
 
             # Parse once per sheet, cache result
@@ -695,7 +707,7 @@ def generate_outputs(
 
                 if xl_wb is not None:
                     write_xl(parsed['question_wording'], col_labels,
-                             parsed['base_values'], answers, data, 100, sheet_label)
+                             parsed['base_values'], answers, data, 100, xl_sheet_key)
 
             # ── fmt3 ─────────────────────────────────────────
             elif fmt == 'fmt3':
@@ -770,7 +782,7 @@ def generate_outputs(
                 if xl_wb is not None:
                     write_xl(parsed['question_wording'], col_labels,
                              [None]*n_cols, companies, pct_data,
-                             100, sheet_label, show_base=False)
+                             100, xl_sheet_key, show_base=False)
                     # second table with N
                     data_with_n = []
                     for ri, company in enumerate(companies):
@@ -789,7 +801,7 @@ def generate_outputs(
                         data_with_n.append(row)
                     write_xl(parsed['question_wording'] + ' (with base)',
                              col_labels, [None]*n_cols, companies,
-                             data_with_n, 1, sheet_label, show_base=False)
+                             data_with_n, 1, xl_sheet_key, show_base=False)
 
             # ── fmt4 ─────────────────────────────────────────
             elif fmt == 'fmt4':
@@ -848,7 +860,7 @@ def generate_outputs(
 
                 if xl_wb is not None:
                     write_xl(parsed['question_wording'], brands,
-                             base_values, answers, data, 100, sheet_label)
+                             base_values, answers, data, 100, xl_sheet_key)
 
             else:
                 skipped.append(f"{sheet_label} (fmt1/grid — skipped)")

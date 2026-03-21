@@ -361,17 +361,24 @@ if (
     </div>
     """, unsafe_allow_html=True)
 
-    # Build (sheet_index, row_filter) list respecting per-group table configs
+    # Build (sheet_index, row_filter, group_prefix, table_label) tuples
+    # group_prefix is used as the Excel sheet name in per_question mode
+    # so all sub-questions in a group land on the same sheet
     tc = st.session_state["table_configs"]
     sheet_table_configs = []
     for grp in st.session_state["q_groups"]:
         prefix  = grp["prefix"]
         configs = tc.get(prefix, [{"label":"All rows","rows":"all"}])
-        for m in grp["sheets"]:
-            if m["index"] not in st.session_state.get("selected_indices", []):
-                continue
-            for cfg in configs:
-                sheet_table_configs.append((m["index"], cfg["rows"]))
+        for cfg in configs:
+            for m in grp["sheets"]:
+                if m["index"] not in st.session_state.get("selected_indices", []):
+                    continue
+                sheet_table_configs.append((
+                    m["index"],
+                    cfg["rows"],
+                    prefix,
+                    cfg["label"],
+                ))
 
     n_tables = len(sheet_table_configs)
     st.info(f"Ready to generate **{n_tables} table(s)** with **{len(selected_cols)} column(s)**.")
