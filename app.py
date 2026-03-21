@@ -208,6 +208,14 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
+# ── Default config values (overwritten by Step 3 if file is loaded) ──
+selected_cols      = []
+output_format      = "Both"
+excel_mode         = "per_question"
+portrait_landscape = False
+weighted_data      = False
+row_filter         = "all"
+
 # ── STEP 1: Upload ────────────────────────────────────────────
 st.markdown("""
 <div class="step-card">
