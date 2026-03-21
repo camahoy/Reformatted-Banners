@@ -8,7 +8,6 @@ import io
 import math
 import numpy as np
 import pandas as pd
-import requests
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -364,13 +363,12 @@ def parse_fmt4_sheet(sheet_df):
 # ── Word output ──────────────────────────────────────────────
 
 def _get_word_template(portrait_landscape=False):
-    portrait  = '15Wd-lWQU0myOOztDZof0wr2e6smUU_sq'
-    landscape = '1qqcZHvPe3NhskKP4HOscm-uIcaUC500L'
-    doc_id    = portrait if portrait_landscape else landscape
-    url       = f"https://drive.google.com/uc?id={doc_id}"
-    r         = requests.get(url, timeout=15)
-    buf       = io.BytesIO(r.content)
-    return Document(buf)
+    import os
+    template_file = 'template_portrait.docx' if portrait_landscape else 'template_landscape.docx'
+    if os.path.exists(template_file):
+        return Document(template_file)
+    # Fallback to blank document if template not found
+    return Document()
 
 
 def write_table_to_doc(doc, question_wording, col_labels, base_values,
