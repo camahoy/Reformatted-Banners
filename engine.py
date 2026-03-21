@@ -168,17 +168,105 @@ def scan_file(file_bytes):
 def get_all_columns(sheet_metas):
     """
     Return deduplicated list of (group, sublabel) column tuples
-    from all fmt2/fmt3 sheets, preserving order.
+    from fmt2/fmt3 sheets only (not fmt4 — those use brand columns).
     """
     seen = set()
     cols = []
     for s in sheet_metas:
-        if s['fmt'] in ('fmt2', 'fmt3', 'fmt4'):
+        if s['fmt'] in ('fmt2', 'fmt3'):
             for col in s['columns']:
                 if col[0] not in seen:
                     seen.add(col[0])
                     cols.append(col)
     return cols
+
+
+def scan_rows_for_sheets(file_bytes, sheet_indices):
+    """
+    Return deduplicated ordered list of answer/row labels
+    across all given sheet indices. Used to populate row checkboxes.
+    """
+    xl   = pd.ExcelFile(io.BytesIO(file_bytes))
+    seen = set()
+    rows = []
+    for i in sheet_indices:
+        try:
+            df  = xl.parse(i, header=None, na_values=[''])
+            fmt = detect_format(df)
+            raw = df.values.tolist()
+            if fmt == 'fmt2':
+                # base row index
+                base_row_idx = None
+                for ri, row in enumerate(raw):
+                    if isinstance(row[0], str) and row[0].strip().lower().startswith('base'):
+                        base_row_idx = ri
+                        break
+                start = (base_row_idx + 2) if base_row_idx is not None else 9
+                j = start
+                while j < len(raw):
+                    label = raw[j][0]
+                    if isinstance(label, str) and label.strip():
+                        clean = label.strip()
+                        if clean.lower() == 'sigma':
+                            break
+                        if clean not in seen:
+                            seen.add(clean)
+                            rows.append(clean)
+                    j += 3
+            elif fmt == 'fmt3':
+                end_markers = {'overlap formula used', 'sigma'}
+                j = 8
+                while j < len(raw):
+                    label = raw[j][0]
+                    if isinstance(label, str) and label.strip():
+                        clean = label.strip()
+                        if clean.lower() in end_markers:
+                            break
+                        if clean not in seen:
+                            seen.add(clean)
+                            rows.append(clean)
+                    j += 3
+            elif fmt == 'fmt4':
+                j = 9
+                while j < len(raw):
+                    label = raw[j][0]
+                    if isinstance(label, str) and label.strip():
+                        clean = label.strip()
+                        if clean.lower() == 'sigma':
+                            break
+                        if clean not in seen:
+                            seen.add(clean)
+                            rows.append(clean)
+                    j += 3
+        except Exception:
+            pass
+    return rows
+
+
+def get_question_groups(sheet_metas):
+    """
+    Group sheets by question prefix (A0, A1, S1 etc).
+    Returns ordered list of dicts:
+      { prefix, sheets: [meta, ...], fmt }
+    fmt is taken from first sheet in group.
+    """
+    import re
+    groups = {}
+    order  = []
+    for m in sheet_metas:
+        if m['fmt'] == 'error':
+            continue
+        # Extract prefix: leading letters + digits e.g. "A0", "S1", "A10"
+        match = re.match(r'^([A-Za-z]+\d+)', m['question_wording'].strip())
+        if match:
+            prefix = match.group(1).upper()
+        else:
+            prefix = m['sheet_name'][:6]
+        if prefix not in groups:
+            groups[prefix] = {'prefix': prefix, 'sheets': [], 'fmt': m['fmt']}
+            order.append(prefix)
+        groups[prefix]['sheets'].append(m)
+    return [groups[p] for p in order]
 
 
 # ── Parsers ──────────────────────────────────────────────────
@@ -490,30 +578,27 @@ def _xl_write_table(ws, start_row, question_wording, col_headers,
 
 def generate_outputs(
     file_bytes,
-    selected_sheet_indices,
+    sheet_table_configs,   # list of (sheet_index, row_filter)
+                           # row_filter: 'all' or list of row label strings
     desired_groups,
     output_format,
     excel_mode,
     portrait_landscape,
     weighted_data,
-    row_filter,          # 'all', 'nets_only', or list of specific row labels
     progress_callback=None,
 ):
     """
     Core generation function called by the Streamlit app.
-
-    Returns dict:
-      {
-        'word_bytes': bytes | None,
-        'excel_bytes': bytes | None,
-        'skipped': list of sheet names that were skipped,
-        'errors': list of (sheet_name, error_message),
-      }
+    sheet_table_configs: list of (sheet_index, row_filter) tuples.
+    The same sheet_index can appear multiple times (one per table config).
     """
-    xl         = pd.ExcelFile(io.BytesIO(file_bytes))
-    total      = len(selected_sheet_indices)
-    skipped    = []
-    errors     = []
+    xl      = pd.ExcelFile(io.BytesIO(file_bytes))
+    total   = max(len(sheet_table_configs), 1)
+    skipped = []
+    errors  = []
+
+    # Cache parsed sheets so we don't re-parse the same sheet multiple times
+    parsed_cache = {}
 
     # Word setup
     word_doc = None
@@ -522,14 +607,14 @@ def generate_outputs(
             word_doc = _get_word_template(portrait_landscape)
         except Exception:
             word_doc = Document()
-        style      = word_doc.styles['Normal']
+        style = word_doc.styles['Normal']
         style.font.name = 'Arial'
         style.font.size = Pt(10)
 
     # Excel setup
-    xl_wb            = None
-    xl_sheet_counter = [0]
-    xl_sheet_rows    = {}   # sheet_name → next_row (for per_question mode)
+    xl_wb         = None
+    xl_sheet_ctr  = [0]
+    xl_sheet_rows = {}
 
     if output_format in ('excel', 'both'):
         xl_wb = openpyxl.Workbook()
@@ -543,55 +628,48 @@ def generate_outputs(
                 xl_sheet_rows[name] = 1
             return xl_wb[name], xl_sheet_rows[name]
         else:
-            xl_sheet_counter[0] += 1
-            sname = f"{xl_sheet_counter[0]:03d}_{name}"[:31]
-            ws = xl_wb.create_sheet(title=sname)
-            return ws, 1
+            xl_sheet_ctr[0] += 1
+            sname = f"{xl_sheet_ctr[0]:03d}_{name}"[:31]
+            return xl_wb.create_sheet(title=sname), 1
 
-    def _xl_done(ws, name, next_row):
+    def _xl_done(ws, label, next_row):
         if excel_mode == 'per_question':
-            xl_sheet_rows[name[:31]] = next_row
+            xl_sheet_rows[label[:31]] = next_row
 
     def write_xl(question_wording, col_headers, base_values, answers,
                  data, multiple, sheet_label, show_base=True):
         ws, row = _xl_get_sheet(sheet_label)
-        next_row = _xl_write_table(ws, row, question_wording, col_headers,
-                                   base_values, answers, data, multiple, show_base)
-        _xl_done(ws, sheet_label, next_row)
+        nr = _xl_write_table(ws, row, question_wording, col_headers,
+                             base_values, answers, data, multiple, show_base)
+        _xl_done(ws, sheet_label, nr)
 
-    # Net label patterns for nets_only filter
-    NET_KEYWORDS = ['box', 'net', 'subnet', 'top', 'bottom', 'mean', 'median', 'average']
-
-    def filter_rows(answers, data):
-        if row_filter == 'all' or row_filter is None:
+    def apply_row_filter(answers, data, row_filter):
+        if row_filter == 'all' or not row_filter:
             return answers, data
-        if row_filter == 'nets_only':
-            filtered_a, filtered_d = [], []
-            for a, d in zip(answers, data):
-                if any(kw in a.lower() for kw in NET_KEYWORDS):
-                    filtered_a.append(a)
-                    filtered_d.append(d)
-            return filtered_a, filtered_d
-        # Custom list of row labels
-        custom = {r.lower() for r in row_filter}
-        filtered_a, filtered_d = [], []
+        custom = {r.strip().lower() for r in row_filter}
+        fa, fd = [], []
         for a, d in zip(answers, data):
             if a.strip().lower() in custom:
-                filtered_a.append(a)
-                filtered_d.append(d)
-        return filtered_a, filtered_d
+                fa.append(a)
+                fd.append(d)
+        return fa, fd
 
     first_word = True
-    multiple   = 100
 
-    for idx, sheet_idx in enumerate(selected_sheet_indices):
+    for idx, (sheet_idx, row_filter) in enumerate(sheet_table_configs):
         if progress_callback:
             progress_callback(idx / total, f"Processing sheet {sheet_idx}…")
 
         try:
-            sheet_df  = xl.parse(sheet_idx, header=None, na_values=[''])
-            fmt       = detect_format(sheet_df)
-            sheet_label = xl.sheet_names[sheet_idx][:31]
+            sheet_name = xl.sheet_names[sheet_idx]
+            sheet_label = sheet_name[:31]
+
+            # Parse once per sheet, cache result
+            if sheet_idx not in parsed_cache:
+                df  = xl.parse(sheet_idx, header=None, na_values=[''])
+                fmt = detect_format(df)
+                parsed_cache[sheet_idx] = (df, fmt)
+            sheet_df, fmt = parsed_cache[sheet_idx]
 
             # ── fmt2 ─────────────────────────────────────────
             if fmt == 'fmt2':
@@ -601,7 +679,7 @@ def generate_outputs(
                     continue
 
                 col_labels = [g for (g, s) in parsed['columns']]
-                answers, data = filter_rows(parsed['answers'], parsed['data'])
+                answers, data = apply_row_filter(parsed["answers"], parsed["data"], row_filter)
 
                 if not answers:
                     skipped.append(sheet_label)
@@ -720,7 +798,7 @@ def generate_outputs(
                     skipped.append(sheet_label)
                     continue
 
-                answers, data = filter_rows(parsed['answers'], parsed['data'])
+                answers, data = apply_row_filter(parsed["answers"], parsed["data"], row_filter)
                 if not answers:
                     skipped.append(sheet_label)
                     continue
