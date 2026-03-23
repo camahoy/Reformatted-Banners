@@ -8,6 +8,7 @@ import streamlit as st
 from engine import (
     scan_file, get_all_columns, get_question_groups,
     scan_rows_for_sheets, generate_outputs,
+    scan_multi_source, generate_merged_outputs,
 )
 
 # ── Page config ───────────────────────────────────────────────
@@ -118,6 +119,11 @@ for k, v in [
     ("group_rows_cache", {}),
     ("table_configs", {}),
     ("selected_indices", []),
+    # Multi-source state
+    ("ms_banners", []),        # list of {"name": str, "file_bytes": bytes, "file": uploaded}
+    ("ms_scan", None),         # result of scan_multi_source
+    ("ms_overrides", {}),      # manual question mappings
+    ("ms_results", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -129,7 +135,327 @@ excel_mode         = "per_question"
 portrait_landscape = False
 weighted_data      = False
 
-# ── STEP 1: Upload ────────────────────────────────────────────
+# ── Mode toggle ───────────────────────────────────────────────
+st.markdown("""
+<div class="step-card" style="padding:1rem 1.6rem">
+    <div class="step-label">Mode</div>
+    <div class="step-title" style="margin-bottom:0.6rem">What do you want to do?</div>
+</div>
+""", unsafe_allow_html=True)
+
+app_mode = st.radio(
+    "Mode",
+    ["📄 Single banner", "🔀 Multi-source merge"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+is_multi = app_mode == "🔀 Multi-source merge"
+st.divider()
+
+# ══════════════════════════════════════════════════════════════
+# MULTI-SOURCE MODE
+# ══════════════════════════════════════════════════════════════
+if is_multi:
+
+    st.markdown("""
+    <div class="step-card">
+        <div class="step-label">Step 1</div>
+        <div class="step-title">Upload banners to merge</div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.caption("Upload 2 or more banners. Give each a short name (e.g. 'Generation', 'Region', 'Total').")
+
+    # Banner slots
+    ms_banners = st.session_state["ms_banners"]
+
+    # Add banner slot
+    if st.button("＋ Add banner", key="ms_add_banner"):
+        ms_banners.append({"name": "", "file_bytes": None, "file_name": None})
+        st.session_state["ms_banners"] = ms_banners
+        st.rerun()
+
+    changed = False
+    for bi, banner in enumerate(ms_banners):
+        with st.container():
+            c1, c2, c3 = st.columns([2, 4, 0.5])
+            new_name = c1.text_input(
+                "Banner name", value=banner["name"],
+                key=f"ms_name_{bi}", placeholder="e.g. Generation",
+                label_visibility="collapsed",
+            )
+            uploaded_ms = c2.file_uploader(
+                "File", type=["xlsx"], key=f"ms_file_{bi}",
+                label_visibility="collapsed",
+            )
+            if c3.button("✕", key=f"ms_del_{bi}"):
+                ms_banners.pop(bi)
+                st.session_state["ms_banners"] = ms_banners
+                st.session_state["ms_scan"] = None
+                st.rerun()
+
+            if new_name != banner["name"]:
+                ms_banners[bi]["name"] = new_name
+                changed = True
+
+            if uploaded_ms and uploaded_ms.name != banner.get("file_name"):
+                ms_banners[bi]["file_bytes"] = uploaded_ms.read()
+                ms_banners[bi]["file_name"]  = uploaded_ms.name
+                if not ms_banners[bi]["name"]:
+                    ms_banners[bi]["name"] = uploaded_ms.name.replace(".xlsx","")[:20]
+                changed = True
+
+    if changed:
+        st.session_state["ms_banners"] = ms_banners
+        st.session_state["ms_scan"] = None
+
+    # Scan when 2+ banners are ready
+    ready_banners = [b for b in ms_banners if b["file_bytes"] and b["name"]]
+    if len(ready_banners) >= 2:
+        if st.button("🔍 Scan & match questions", use_container_width=True):
+            with st.spinner("Scanning banners and matching questions…"):
+                file_list = [(b["file_bytes"], b["name"]) for b in ready_banners]
+                st.session_state["ms_scan"] = scan_multi_source(file_list)
+                st.session_state["ms_overrides"] = {}
+            st.rerun()
+
+    ms_scan = st.session_state.get("ms_scan")
+
+    if ms_scan:
+        matched   = ms_scan["matched"]
+        unmatched = ms_scan["unmatched"]
+        banners   = ms_scan["banners"]
+
+        # Summary
+        auto_matched = sum(
+            1 for e in matched
+            if all(v is not None for v in e["banner_sheets"].values())
+        )
+        partial = len(matched) - auto_matched
+
+        st.markdown(f"""
+        <div class="step-card">
+            <div class="step-label">Step 2</div>
+            <div class="step-title">Question matching</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Auto-matched", auto_matched)
+        mc2.metric("Partially matched", partial)
+        mc3.metric("Unmatched", len(unmatched))
+
+        # Manual mapping for partial/unmatched
+        overrides = st.session_state["ms_overrides"]
+
+        if partial > 0 or unmatched:
+            with st.expander(f"⚠️ {partial + len(unmatched)} question(s) need manual mapping", expanded=True):
+                st.caption("For each question, select which sheet in the other banner corresponds to it, or choose 'Skip'.")
+
+                # Partial matches
+                for entry in matched:
+                    missing_banners = [bn for bn, sm in entry["banner_sheets"].items() if sm is None]
+                    if not missing_banners:
+                        continue
+
+                    st.markdown(f"**{entry['q_id']}** — {entry['wording'][:70]}…")
+                    for bn in missing_banners:
+                        # Find sheets in that banner
+                        b_sheets = next((b["sheets"] for b in banners if b["name"] == bn), [])
+                        options  = ["— Skip —"] + [
+                            f"{m['sheet_name']}: {m['question_wording'][:50]}"
+                            for m in b_sheets if m["fmt"] != "error"
+                        ]
+                        sheet_metas = [None] + [
+                            m for m in b_sheets if m["fmt"] != "error"
+                        ]
+                        sel = st.selectbox(
+                            f"Match in **{bn}**",
+                            options, index=0,
+                            key=f"ms_map_{entry['q_id']}_{bn}",
+                        )
+                        sel_idx = options.index(sel)
+                        if sel_idx > 0:
+                            if entry["q_id"] not in overrides:
+                                overrides[entry["q_id"]] = {}
+                            overrides[entry["q_id"]][bn] = sheet_metas[sel_idx]["index"]
+
+                # Fully unmatched
+                for u_entry in unmatched:
+                    st.markdown(f"**{u_entry['q_id']}** (from {u_entry['banner_name']}) — {u_entry['sheet_meta']['question_wording'][:60]}…")
+                    for b in banners:
+                        if b["name"] == u_entry["banner_name"]:
+                            continue
+                        b_sheets = b["sheets"]
+                        options  = ["— Skip —"] + [
+                            f"{m['sheet_name']}: {m['question_wording'][:50]}"
+                            for m in b_sheets if m["fmt"] != "error"
+                        ]
+                        sheet_metas = [None] + [m for m in b_sheets if m["fmt"] != "error"]
+                        sel = st.selectbox(
+                            f"Match in **{b['name']}**",
+                            options, index=0,
+                            key=f"ms_umap_{u_entry['q_id']}_{b['name']}",
+                        )
+                        sel_idx = options.index(sel)
+                        if sel_idx > 0:
+                            if u_entry["q_id"] not in overrides:
+                                overrides[u_entry["q_id"]] = {}
+                            overrides[u_entry["q_id"]][b["name"]] = sheet_metas[sel_idx]["index"]
+
+                st.session_state["ms_overrides"] = overrides
+
+        # Step 3 — Column selection per banner
+        st.markdown("""
+        <div class="step-card">
+            <div class="step-label">Step 3</div>
+            <div class="step-title">Select columns per banner</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption("Choose which columns from each banner to include in the merged output.")
+
+        selected_cols_per_banner = {}
+        for b in banners:
+            st.markdown(f"**{b['name']}**")
+            all_cols_b = b["all_cols"]
+            if not all_cols_b:
+                st.caption("No columns found.")
+                selected_cols_per_banner[b["name"]] = []
+                continue
+
+            qca, qcb = st.columns(2)
+            if qca.button("Select all", key=f"ms_selall_{b['name']}", use_container_width=True):
+                for g, _ in all_cols_b:
+                    st.session_state[f"ms_col_{b['name']}_{g}"] = True
+            if qcb.button("Clear all", key=f"ms_clrall_{b['name']}", use_container_width=True):
+                for g, _ in all_cols_b:
+                    st.session_state[f"ms_col_{b['name']}_{g}"] = False
+
+            col_grid = st.columns(4)
+            sel_cols = []
+            for ci, (g, s) in enumerate(all_cols_b):
+                label   = g if not s or s.lower() == 'total' else f"{g}  ·  {s}"
+                default = not s or s.lower() in ('total', '')
+                if col_grid[ci % 4].checkbox(
+                    label,
+                    value=st.session_state.get(f"ms_col_{b['name']}_{g}", default),
+                    key=f"ms_col_{b['name']}_{g}",
+                ):
+                    sel_cols.append(g)
+            selected_cols_per_banner[b["name"]] = sel_cols
+            st.markdown("---")
+
+        # Step 4 — Output settings
+        st.markdown("""
+        <div class="step-card">
+            <div class="step-label">Step 4</div>
+            <div class="step-title">Output settings</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        ms_c1, ms_c2, ms_c3, ms_c4 = st.columns(4)
+        with ms_c1:
+            ms_ofl = st.radio("Output", ["Word (.docx)","Excel (.xlsx)","Both"],
+                              index=2, key="ms_output_fmt")
+            ms_output = {"Word (.docx)":"word","Excel (.xlsx)":"excel","Both":"both"}[ms_ofl]
+        with ms_c2:
+            if ms_output in ("excel","both"):
+                ms_eml = st.radio("Excel layout",
+                                  ["One sheet per question","One sheet per table"],
+                                  index=0, key="ms_excel_mode")
+                ms_excel_mode = "per_question" if "question" in ms_eml else "per_table"
+            else:
+                ms_excel_mode = "per_question"
+        with ms_c3:
+            ms_ori = st.radio("Orientation", ["Landscape","Portrait"],
+                              index=0, key="ms_orientation")
+            ms_portrait = ms_ori == "Portrait"
+        with ms_c4:
+            ms_weighted = st.toggle("Weighted data", value=False, key="ms_weighted")
+
+        ms_row_filter = "all"
+        ms_rf_label = st.radio(
+            "Rows to show",
+            ["All rows", "Custom selection"],
+            index=0, key="ms_row_filter", horizontal=True,
+        )
+        if ms_rf_label == "Custom selection":
+            ms_custom = st.text_area(
+                "Row labels (one per line)",
+                placeholder="Top 2 Box (Net)\nBottom 2 Box (Net)",
+                height=100, key="ms_custom_rows",
+                label_visibility="collapsed",
+            )
+            ms_row_filter = [r.strip() for r in ms_custom.splitlines() if r.strip()] or "all"
+
+        # Generate
+        st.markdown("""
+        <div class="step-card">
+            <div class="step-label">Step 5</div>
+            <div class="step-title">Generate merged output</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        any_cols = any(len(v) > 0 for v in selected_cols_per_banner.values())
+        if not any_cols:
+            st.warning("Select at least one column from at least one banner.")
+        else:
+            total_q = len([e for e in matched
+                           if any(v is not None for v in e["banner_sheets"].values())])
+            st.info(f"Ready to merge **{total_q} questions** across **{len(banners)} banners**.")
+
+            if st.button("🚀 Generate Merged Document", type="primary", key="ms_generate"):
+                bar = st.progress(0, text="Starting…")
+                def ms_upd(pct, msg):
+                    bar.progress(min(float(pct), 1.0), text=msg)
+
+                with st.spinner(""):
+                    ms_results = generate_merged_outputs(
+                        multi_source              = ms_scan,
+                        matched_overrides         = st.session_state["ms_overrides"],
+                        selected_cols_per_banner  = selected_cols_per_banner,
+                        output_format             = ms_output,
+                        excel_mode                = ms_excel_mode,
+                        portrait_landscape        = ms_portrait,
+                        weighted_data             = ms_weighted,
+                        row_filter                = ms_row_filter,
+                        progress_callback         = ms_upd,
+                    )
+                bar.progress(1.0, text="Done!")
+                st.session_state["ms_results"] = ms_results
+
+        if st.session_state.get("ms_results"):
+            res  = st.session_state["ms_results"]
+            if res.get("errors"):
+                with st.expander(f"⚠️ {len(res['errors'])} error(s)"):
+                    for sh, err in res["errors"]:
+                        st.error(f"**{sh}**: {err}")
+            if res.get("skipped"):
+                with st.expander(f"ℹ️ {len(res['skipped'])} skipped"):
+                    for s in res["skipped"]:
+                        st.write(f"• {s}")
+
+            st.success("✅ Merged output ready")
+            d1, d2 = st.columns(2)
+            if res.get("word_bytes"):
+                d1.download_button(
+                    "⬇️ Download Word (.docx)", data=res["word_bytes"],
+                    file_name="merged_output.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+            if res.get("excel_bytes"):
+                d2.download_button(
+                    "⬇️ Download Excel (.xlsx)", data=res["excel_bytes"],
+                    file_name="merged_output.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+    st.stop()  # Don't render single-banner UI in multi mode
+
+# ══════════════════════════════════════════════════════════════
+# SINGLE BANNER MODE (original flow continues below)
+# ══════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="step-card">
     <div class="step-label">Step 1</div>
