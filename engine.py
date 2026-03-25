@@ -18,6 +18,7 @@ from openpyxl.styles import Font as XLFont, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 
+
 # ── Helper functions ─────────────────────────────────────────
 
 def lowerList(inputList):
