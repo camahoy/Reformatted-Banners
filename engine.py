@@ -113,11 +113,18 @@ def detect_format(sheet_df):
             isinstance(row2_col0, str) and len(row2_col0.strip()) > 10
             and isinstance(row3_col1, str) and 'total' in row3_col1.lower()
         ):
-            row7      = raw[7]
-            row7_col0 = row7[0] if row7 else None
-            row7_col1 = row7[1] if len(row7) > 1 else None
-            if isinstance(row7_col0, str) and row7_col0.strip().lower().startswith('base'):
-                if row7_col1 is None or (isinstance(row7_col1, float) and math.isnan(row7_col1)):
+            # Check rows 7-11 for any base label (handles both weighted and unweighted)
+            base_row_col0 = None
+            base_row_col1 = None
+            for check_row in range(7, min(12, len(raw))):
+                cell = raw[check_row][0] if raw[check_row] else None
+                if isinstance(cell, str) and 'base' in cell.lower():
+                    base_row_col0 = cell
+                    base_row_col1 = raw[check_row][1] if len(raw[check_row]) > 1 else None
+                    break
+
+            if base_row_col0 is not None:
+                if base_row_col1 is None or (isinstance(base_row_col1, float) and math.isnan(base_row_col1)):
                     return 'fmt3'
                 return 'fmt2'
     except (IndexError, TypeError):
@@ -341,25 +348,31 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False):
     col_indices   = [j for (j, g, s) in selected_cols]
     col_labels    = [(g, s) for (j, g, s) in selected_cols]
 
-    # Base row
+    # Base row — find first row where col 0 contains 'base' (handles 'Unweighted Base' too)
     base_row_idx = None
     for i, row in enumerate(raw):
-        if isinstance(row[0], str) and row[0].strip().lower().startswith('base'):
+        if isinstance(row[0], str) and 'base' in row[0].strip().lower():
             base_row_idx = i
             break
 
-    base_offset   = 1 if weighted_data else 0
+    # For weighted data: Unweighted Base is at base_row_idx, weighted at base_row_idx+2
+    # For unweighted: Base: Total Answering is at base_row_idx, counts on same row (offset 0)
+    base_offset   = 2 if weighted_data else 0
     base_values   = []
     if base_row_idx is not None:
-        base_data_row = raw[base_row_idx + base_offset]
+        base_data_row = raw[base_row_idx + base_offset] if base_row_idx + base_offset < len(raw) else []
         base_values   = [base_data_row[j] if j < len(base_data_row) else None for j in col_indices]
 
+    # Data starts after both base rows
+    # Weighted: unweighted(row 7) + blank(8) + weighted(9) + blank(10) = data at row 11 → base_rows_used=4
+    # Unweighted: base(row 7) + blank(8) = data at row 9 → base_rows_used=2
+    base_rows_used = 4 if weighted_data else 2
+    data_start = (base_row_idx + base_rows_used) if base_row_idx is not None else 9
+
     # Answers + data
-    answers    = []
-    data       = []
-    sig_data   = []   # stat sig letters per answer per col
-    base_rows_used = 2 if weighted_data else 1
-    data_start = (base_row_idx + base_rows_used + 1) if base_row_idx is not None else 9
+    answers  = []
+    data     = []
+    sig_data = []
 
     # Column letter codes (row 5, 0-based) — used for sig flag logic
     letter_row  = raw[5] if len(raw) > 5 else []
