@@ -1,5 +1,5 @@
 """
-engine.py — Banner Formatter core logic
+engine.py — Banner Formatter core logic v1.4
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
