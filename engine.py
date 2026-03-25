@@ -1,5 +1,5 @@
 """
-engine.py — Banner Formatter core logic v1.4
+engine.py — Banner Formatter core logic v1.5
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
@@ -113,15 +113,17 @@ def detect_format(sheet_df):
             isinstance(row2_col0, str) and len(row2_col0.strip()) > 10
             and isinstance(row3_col1, str) and 'total' in row3_col1.lower()
         ):
-            # Check rows 7-11 for any base label (handles both weighted and unweighted)
+            # Check rows 7-11 for a base label (must start with 'base' or 'unweighted')
             base_row_col0 = None
             base_row_col1 = None
             for check_row in range(7, min(12, len(raw))):
                 cell = raw[check_row][0] if raw[check_row] else None
-                if isinstance(cell, str) and 'base' in cell.lower():
-                    base_row_col0 = cell
-                    base_row_col1 = raw[check_row][1] if len(raw[check_row]) > 1 else None
-                    break
+                if isinstance(cell, str):
+                    stripped = cell.strip().lower()
+                    if stripped.startswith('base') or stripped.startswith('unweighted'):
+                        base_row_col0 = cell
+                        base_row_col1 = raw[check_row][1] if len(raw[check_row]) > 1 else None
+                        break
 
             if base_row_col0 is not None:
                 if base_row_col1 is None or (isinstance(base_row_col1, float) and math.isnan(base_row_col1)):
@@ -348,12 +350,20 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False):
     col_indices   = [j for (j, g, s) in selected_cols]
     col_labels    = [(g, s) for (j, g, s) in selected_cols]
 
-    # Base row — find first row where col 0 contains 'base' (handles 'Unweighted Base' too)
+    # Base row — find first row where col 0 is a base label
+    # Must start with 'base' OR be 'unweighted base' — never match mid-sentence 'based'
+    BASE_LABELS = {'base', 'unweighted base', 'weighted base'}
     base_row_idx = None
     for i, row in enumerate(raw):
-        if isinstance(row[0], str) and 'base' in row[0].strip().lower():
-            base_row_idx = i
-            break
+        cell = row[0] if row else None
+        if isinstance(cell, str):
+            stripped = cell.strip().lower()
+            # Match if it starts with 'base' or 'unweighted' followed by 'base'
+            if (stripped.startswith('base') or
+                stripped.startswith('unweighted') or
+                stripped.startswith('weighted base')):
+                base_row_idx = i
+                break
 
     # For weighted data: Unweighted Base is at base_row_idx, weighted at base_row_idx+2
     # For unweighted: Base: Total Answering is at base_row_idx, counts on same row (offset 0)
