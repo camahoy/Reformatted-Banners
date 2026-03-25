@@ -470,6 +470,13 @@ st.markdown("""
 
 uploaded = st.file_uploader("File", type=["xlsx"], label_visibility="collapsed")
 
+# Allow force re-scan if user re-uploads same file after an app update
+if st.session_state.get("file_name") and st.button(
+    "🔄 Re-scan current file", help="Use this if columns aren't showing after an app update"
+):
+    st.session_state["file_hash"] = None  # force re-scan on next render
+    st.rerun()
+
 if uploaded:
     import hashlib
     file_bytes_new = uploaded.read()
