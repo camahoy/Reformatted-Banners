@@ -142,9 +142,15 @@ def scan_file(file_bytes):
             df  = xl.parse(i, header=None, na_values=[''])
             fmt = detect_format(df)
             raw = df.values.tolist()
-            question_wording = str(raw[2][0]).strip() if (
-                len(raw) > 2 and raw[2] and raw[2][0]
-            ) else sheet_name
+            # Question wording: fmt5 has it at row 3, others at row 2
+            if fmt == 'fmt5':
+                question_wording = str(raw[3][0]).strip() if (
+                    len(raw) > 3 and raw[3] and raw[3][0]
+                ) else sheet_name
+            else:
+                question_wording = str(raw[2][0]).strip() if (
+                    len(raw) > 2 and raw[2] and raw[2][0]
+                ) else sheet_name
 
             # Collect available columns
             columns = []
@@ -351,8 +357,13 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False):
     # Answers + data
     answers    = []
     data       = []
+    sig_data   = []   # stat sig letters per answer per col
     base_rows_used = 2 if weighted_data else 1
     data_start = (base_row_idx + base_rows_used + 1) if base_row_idx is not None else 9
+
+    # Column letter codes (row 5, 0-based) — used for sig flag logic
+    letter_row  = raw[5] if len(raw) > 5 else []
+    col_letters = [letter_row[j] if j < len(letter_row) else None for j in col_indices]
 
     i = data_start
     while i < len(raw):
@@ -362,9 +373,12 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False):
             if label_clean.lower() == 'sigma':
                 break
             answers.append(label_clean)
-            pct_row  = raw[i + 1] if i + 1 < len(raw) else []
+            pct_row = raw[i + 1] if i + 1 < len(raw) else []
+            sig_row = raw[i + 2] if i + 2 < len(raw) else []
             row_vals = [pct_row[j] if j < len(pct_row) else None for j in col_indices]
+            sig_vals = [sig_row[j]  if j < len(sig_row)  else None for j in col_indices]
             data.append(row_vals)
+            sig_data.append(sig_vals)
         i += 3
 
     return {
@@ -373,6 +387,8 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False):
         'base_values':      base_values,
         'answers':          answers,
         'data':             data,
+        'sig_data':         sig_data,
+        'col_letters':      col_letters,
     }
 
 
@@ -531,8 +547,14 @@ def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False):
     base_values  = [base_row[j] if j < len(base_row) else None for j in col_indices]
 
     # Answers start at row 12, every 3 rows
-    answers = []
-    data    = []
+    answers  = []
+    data     = []
+    sig_data = []
+
+    # Column letter codes at row 6
+    letter_row  = raw[6] if len(raw) > 6 else []
+    col_letters = [letter_row[j] if j < len(letter_row) else None for j in col_indices]
+
     i = 12
     while i < len(raw):
         label = raw[i][0]
@@ -541,8 +563,10 @@ def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False):
             if label_clean.lower() == 'sigma':
                 break
             answers.append(label_clean)
-            pct_row  = raw[i + 1] if i + 1 < len(raw) else []
+            pct_row = raw[i + 1] if i + 1 < len(raw) else []
+            sig_row = raw[i + 2] if i + 2 < len(raw) else []
             row_vals = []
+            sig_vals = []
             for j in col_indices:
                 v = pct_row[j] if j < len(pct_row) else None
                 if v is None or (isinstance(v, float) and math.isnan(v)):
@@ -551,7 +575,10 @@ def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False):
                     row_vals.append(None)
                 else:
                     row_vals.append(v)
+                sv = sig_row[j] if j < len(sig_row) else None
+                sig_vals.append(sv if isinstance(sv, str) else None)
             data.append(row_vals)
+            sig_data.append(sig_vals)
         i += 3
 
     return {
@@ -560,7 +587,95 @@ def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False):
         'base_values':      base_values,
         'answers':          answers,
         'data':             data,
+        'sig_data':         sig_data,
+        'col_letters':      col_letters,
     }
+
+
+# ── Heatmap & stat sig helpers ───────────────────────────────
+
+def _hex_to_rgb(hex_color):
+    h = hex_color.lstrip('#')
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+def _interpolate_color(start_hex, end_hex, t):
+    """Interpolate between two hex colors. t=0 → start, t=1 → end."""
+    r1, g1, b1 = _hex_to_rgb(start_hex)
+    r2, g2, b2 = _hex_to_rgb(end_hex)
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return f"{r:02X}{g:02X}{b:02X}"
+
+HEATMAP_SCHEMES = {
+    "Blue scale":          ("#EFF6FF", "#1D4ED8"),
+    "Green scale":         ("#F0FDF4", "#166534"),
+    "Red-Green diverging": ("#DC2626", "#16A34A"),
+    "None":                None,
+}
+
+def get_heatmap_color(value, min_val, max_val, scheme_name,
+                      custom_start=None, custom_end=None):
+    """Return hex color string (no #) for a value within range."""
+    if scheme_name == "None" or min_val is None or max_val is None:
+        return None
+    if max_val == min_val:
+        t = 0.5
+    else:
+        t = (value - min_val) / (max_val - min_val)
+        t = max(0.0, min(1.0, t))
+
+    if scheme_name == "Custom" and custom_start and custom_end:
+        start, end = custom_start, custom_end
+    else:
+        pair = HEATMAP_SCHEMES.get(scheme_name)
+        if not pair:
+            return None
+        start, end = pair
+
+    return _interpolate_color(start, end, t)
+
+
+def build_sig_flags(sig_data, col_letters, total_col_idx=0):
+    """
+    Build a 2D list of sig flags matching data shape.
+    Flag = '▲' if this col's letter appears in sig_data of another col (higher than total)
+         = '▼' if total col's sig_data contains this col's letter (lower than total)
+         = ''  otherwise
+
+    sig_data:     list of rows, each row = list of sig strings per col
+    col_letters:  list of letter codes per col (e.g. ['A','B','C'...])
+    total_col_idx: index of the Total column (default 0)
+    """
+    if not sig_data or not col_letters:
+        return [['' for _ in row] for row in sig_data]
+
+    total_letter = col_letters[total_col_idx] if total_col_idx < len(col_letters) else 'A'
+    flags = []
+
+    for row_sig in sig_data:
+        row_flags = []
+        # Get the total col's sig string for this row
+        total_sig_str = row_sig[total_col_idx] if total_col_idx < len(row_sig) else ''
+        total_sig_str = str(total_sig_str) if total_sig_str else ''
+
+        for ci, sig_str in enumerate(row_sig):
+            if ci == total_col_idx:
+                row_flags.append('')
+                continue
+            sig_str = str(sig_str) if sig_str else ''
+            this_letter = col_letters[ci] if ci < len(col_letters) else ''
+
+            if total_letter and total_letter.upper() in sig_str.upper():
+                # This col is sig higher than Total
+                row_flags.append(' ▲')
+            elif this_letter and this_letter.upper() in total_sig_str.upper():
+                # Total is sig higher than this col → this col is sig lower
+                row_flags.append(' ▼')
+            else:
+                row_flags.append('')
+        flags.append(row_flags)
+    return flags
 
 
 # ── Word output ──────────────────────────────────────────────
@@ -575,7 +690,26 @@ def _get_word_template(portrait_landscape=False):
 
 
 def write_table_to_doc(doc, question_wording, col_labels, base_values,
-                       answers, data, multiple, is_first):
+                       answers, data, multiple, is_first,
+                       sig_flags=None, heatmap_scheme=None,
+                       heatmap_custom_start=None, heatmap_custom_end=None):
+    """
+    sig_flags: 2D list [row][col] of '' / ' ▲' / ' ▼'
+    heatmap_scheme: name from HEATMAP_SCHEMES or 'Custom'
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    def _set_cell_shading(cell, hex_color):
+        """Apply background shading to a Word table cell."""
+        tc   = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd  = OxmlElement('w:shd')
+        shd.set(qn('w:val'),   'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'),  hex_color)
+        tcPr.append(shd)
+
     if not is_first:
         doc.add_paragraph()
     q_para       = doc.add_paragraph()
@@ -597,26 +731,51 @@ def write_table_to_doc(doc, question_wording, col_labels, base_values,
         ).bold = True
         hdr[i + 1].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
 
+    # Collect all numeric values for heatmap range
+    all_vals = []
+    if heatmap_scheme and heatmap_scheme != "None":
+        for row in data:
+            for v in row:
+                if v is not None and not isinstance(v, str):
+                    try:
+                        all_vals.append(float(v) * multiple)
+                    except Exception:
+                        pass
+    min_val = min(all_vals) if all_vals else None
+    max_val = max(all_vals) if all_vals else None
+
     for r_idx, answer in enumerate(answers):
         if str(answer).strip().lower() == 'sigma':
             continue
         row_cells = table.add_row().cells
         row_cells[0].text = str(answer)
-        row_vals  = data[r_idx] if r_idx < len(data) else []
+        row_vals  = data[r_idx]     if r_idx < len(data)      else []
+        row_flags = sig_flags[r_idx] if sig_flags and r_idx < len(sig_flags) else []
+
         for c_idx in range(n_cols):
-            val  = row_vals[c_idx] if c_idx < len(row_vals) else None
-            cell = row_cells[c_idx + 1]
+            val   = row_vals[c_idx]  if c_idx < len(row_vals)  else None
+            flag  = row_flags[c_idx] if c_idx < len(row_flags) else ''
+            cell  = row_cells[c_idx + 1]
             cell.text = ''
+
             if val is None or (isinstance(val, float) and math.isnan(val)):
-                pass
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
             elif isinstance(val, str):
-                cell.paragraphs[0].add_run(val)
+                cell.paragraphs[0].add_run(val + flag)
                 cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
             else:
-                cell.paragraphs[0].add_run(
-                    f"{normal_round(round(val * multiple, 3))}%"
-                )
+                pct_val = normal_round(round(val * multiple, 3))
+                cell.paragraphs[0].add_run(f"{pct_val}%{flag}")
                 cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+                # Heatmap shading
+                if heatmap_scheme and heatmap_scheme != "None" and min_val is not None:
+                    hex_col = get_heatmap_color(
+                        float(val) * multiple, min_val, max_val,
+                        heatmap_scheme, heatmap_custom_start, heatmap_custom_end
+                    )
+                    if hex_col:
+                        _set_cell_shading(cell, hex_col)
 
     for j in range(n_cols + 1):
         for cell in table.columns[j].cells:
@@ -638,7 +797,9 @@ BORDER    = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 def _xl_write_table(ws, start_row, question_wording, col_headers,
                     base_values, answers, data, multiple=100,
-                    show_base_in_header=True):
+                    show_base_in_header=True, sig_flags=None,
+                    heatmap_scheme=None, heatmap_custom_start=None,
+                    heatmap_custom_end=None):
     ws.cell(row=start_row, column=1, value=question_wording)
     ws.cell(row=start_row, column=1).font = XLFont(bold=True, name="Arial", size=10)
     ws.merge_cells(start_row=start_row, start_column=1,
@@ -658,26 +819,50 @@ def _xl_write_table(ws, start_row, question_wording, col_headers,
         cell.border     = BORDER
     start_row += 1
 
+    # Heatmap range
+    all_vals = []
+    if heatmap_scheme and heatmap_scheme != "None":
+        for row in data:
+            for v in row:
+                if v is not None and not isinstance(v, str):
+                    try:
+                        all_vals.append(float(v) * multiple)
+                    except Exception:
+                        pass
+    min_val = min(all_vals) if all_vals else None
+    max_val = max(all_vals) if all_vals else None
+
     for ri, answer in enumerate(answers):
         if str(answer).strip().lower() == 'sigma':
             continue
-        row_vals   = data[ri] if ri < len(data) else []
+        row_vals   = data[ri]       if ri < len(data)       else []
+        row_flags  = sig_flags[ri]  if sig_flags and ri < len(sig_flags) else []
         label_cell = ws.cell(row=start_row, column=1, value=str(answer))
         label_cell.font      = BODY_FONT
         label_cell.alignment = LEFT
         label_cell.border    = BORDER
         for ci in range(len(col_headers)):
-            val  = row_vals[ci] if ci < len(row_vals) else None
-            cell = ws.cell(row=start_row, column=ci + 2)
+            val   = row_vals[ci]  if ci < len(row_vals)  else None
+            flag  = row_flags[ci] if ci < len(row_flags) else ''
+            cell  = ws.cell(row=start_row, column=ci + 2)
             cell.font      = BODY_FONT
             cell.alignment = CTR
             cell.border    = BORDER
             if val is None or (isinstance(val, float) and math.isnan(val)):
                 cell.value = ''
             elif isinstance(val, str):
-                cell.value = val
+                cell.value = val + (flag or '')
             else:
-                cell.value = f"{normal_round(round(val * multiple, 3))}%"
+                pct_val    = normal_round(round(val * multiple, 3))
+                cell.value = f"{pct_val}%{flag or ''}"
+                # Heatmap fill
+                if heatmap_scheme and heatmap_scheme != "None" and min_val is not None:
+                    hex_col = get_heatmap_color(
+                        float(val) * multiple, min_val, max_val,
+                        heatmap_scheme, heatmap_custom_start, heatmap_custom_end
+                    )
+                    if hex_col:
+                        cell.fill = PatternFill("solid", fgColor=hex_col)
         start_row += 1
 
     ws.column_dimensions['A'].width = max(ws.column_dimensions['A'].width, 35)
@@ -689,18 +874,47 @@ def _xl_write_table(ws, start_row, question_wording, col_headers,
     return start_row + 1
 
 
+def _prep_fmt2_fmt5(parsed, row_filter, show_sig_flags):
+    """Extract col_labels, filtered answers/data/sig, and compute flags."""
+    col_labels  = [g for (g, s) in parsed['columns']]
+    all_answers = parsed["answers"]
+    all_data    = parsed["data"]
+    all_sig     = parsed.get("sig_data", [[] for _ in all_answers])
+
+    if row_filter and row_filter != 'all':
+        custom = {r.strip().lower() for r in row_filter}
+        filtered = [(a, d, s) for a, d, s in zip(all_answers, all_data, all_sig)
+                    if a.strip().lower() in custom]
+        answers  = [f[0] for f in filtered]
+        data     = [f[1] for f in filtered]
+        sig_data = [f[2] for f in filtered]
+    else:
+        answers  = all_answers
+        data     = all_data
+        sig_data = all_sig
+
+    flags = None
+    if show_sig_flags and sig_data:
+        flags = build_sig_flags(sig_data, parsed.get('col_letters', []))
+
+    return col_labels, answers, data, flags
+
+
 # ── Main generation function ─────────────────────────────────
 
 def generate_outputs(
     file_bytes,
-    sheet_table_configs,   # list of (sheet_index, row_filter)
-                           # row_filter: 'all' or list of row label strings
+    sheet_table_configs,
     desired_groups,
     output_format,
     excel_mode,
     portrait_landscape,
     weighted_data,
     progress_callback=None,
+    show_sig_flags=False,
+    heatmap_scheme="None",
+    heatmap_custom_start=None,
+    heatmap_custom_end=None,
 ):
     """
     Core generation function called by the Streamlit app.
@@ -805,9 +1019,8 @@ def generate_outputs(
                     skipped.append(sheet_label)
                     continue
 
-                col_labels = [g for (g, s) in parsed['columns']]
-                answers, data = apply_row_filter(parsed["answers"], parsed["data"], row_filter)
-
+                col_labels, answers, data, flags = _prep_fmt2_fmt5(
+                    parsed, row_filter, show_sig_flags)
                 if not answers:
                     skipped.append(sheet_label)
                     continue
@@ -817,12 +1030,25 @@ def generate_outputs(
                         word_doc, parsed['question_wording'],
                         col_labels, parsed['base_values'],
                         answers, data, 100, first_word,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
                     )
                     first_word = False
 
                 if xl_wb is not None:
-                    write_xl(parsed['question_wording'], col_labels,
-                             parsed['base_values'], answers, data, 100, xl_sheet_key)
+                    ws, row_num = _xl_get_sheet(xl_sheet_key)
+                    nr = _xl_write_table(
+                        ws, row_num, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, True,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
+                    )
+                    _xl_done(ws, xl_sheet_key, nr)
 
             # ── fmt5 ─────────────────────────────────────────
             elif fmt == 'fmt5':
@@ -831,9 +1057,8 @@ def generate_outputs(
                     skipped.append(sheet_label)
                     continue
 
-                col_labels = [g for (g, s) in parsed['columns']]
-                answers, data = apply_row_filter(parsed["answers"], parsed["data"], row_filter)
-
+                col_labels, answers, data, flags = _prep_fmt2_fmt5(
+                    parsed, row_filter, show_sig_flags)
                 if not answers:
                     skipped.append(sheet_label)
                     continue
@@ -843,12 +1068,25 @@ def generate_outputs(
                         word_doc, parsed['question_wording'],
                         col_labels, parsed['base_values'],
                         answers, data, 100, first_word,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
                     )
                     first_word = False
 
                 if xl_wb is not None:
-                    write_xl(parsed['question_wording'], col_labels,
-                             parsed['base_values'], answers, data, 100, xl_sheet_key)
+                    ws, row_num = _xl_get_sheet(xl_sheet_key)
+                    nr = _xl_write_table(
+                        ws, row_num, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, True,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
+                    )
+                    _xl_done(ws, xl_sheet_key, nr)
             elif fmt == 'fmt3':
                 parsed     = parse_fmt3_sheet(sheet_df, desired_groups)
                 if not parsed['answers']:

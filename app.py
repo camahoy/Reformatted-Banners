@@ -115,25 +115,30 @@ st.markdown("""
 # ── Session state init ────────────────────────────────────────
 for k, v in [
     ("sheet_metas", None), ("file_bytes", None), ("file_name", None),
-    ("all_cols", None), ("q_groups", None), ("results", None),
+    ("file_hash", None), ("all_cols", None), ("q_groups", None),
+    ("results", None),
     ("group_rows_cache", {}),
     ("table_configs", {}),
     ("selected_indices", []),
     # Multi-source state
-    ("ms_banners", []),        # list of {"name": str, "file_bytes": bytes, "file": uploaded}
-    ("ms_scan", None),         # result of scan_multi_source
-    ("ms_overrides", {}),      # manual question mappings
+    ("ms_banners", []),
+    ("ms_scan", None),
+    ("ms_overrides", {}),
     ("ms_results", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ── Default config values ─────────────────────────────────────
-selected_cols      = []
-output_format      = "both"
-excel_mode         = "per_question"
-portrait_landscape = False
-weighted_data      = False
+selected_cols        = []
+output_format        = "both"
+excel_mode           = "per_question"
+portrait_landscape   = False
+weighted_data        = False
+show_sig_flags       = False
+heatmap_scheme       = "None"
+heatmap_custom_start = None
+heatmap_custom_end   = None
 
 # ── Mode toggle ───────────────────────────────────────────────
 st.markdown("""
@@ -465,21 +470,35 @@ st.markdown("""
 
 uploaded = st.file_uploader("File", type=["xlsx"], label_visibility="collapsed")
 
-if uploaded and uploaded.name != st.session_state.get("file_name"):
-    with st.spinner("Reading file and detecting formats…"):
-        fb = uploaded.read()
-        metas = scan_file(fb)
-        st.session_state.update({
-            "file_bytes":         fb,
-            "file_name":          uploaded.name,
-            "sheet_metas":        metas,
-            "all_cols":           get_all_columns(metas),
-            "q_groups":           get_question_groups(metas),
-            "selected_indices":   [m["index"] for m in metas if m["fmt"] != "error"],
-            "results":            None,
-            "group_rows_cache":   {},
-            "table_configs":      {},
-        })
+if uploaded:
+    import hashlib
+    file_bytes_new = uploaded.read()
+    file_hash = hashlib.md5(file_bytes_new).hexdigest()
+    if file_hash != st.session_state.get("file_hash"):
+        with st.spinner("Reading file and detecting formats…"):
+            metas   = scan_file(file_bytes_new)
+            q_grps  = get_question_groups(metas)
+            sel_idx = [m["index"] for m in metas if m["fmt"] != "error"]
+
+            # Pre-load row labels for every group so custom selection works immediately
+            row_cache = {}
+            for grp in q_grps:
+                grp_indices = [s["index"] for s in grp["sheets"] if s["index"] in sel_idx]
+                if grp_indices:
+                    row_cache[grp["prefix"]] = scan_rows_for_sheets(file_bytes_new, grp_indices)
+
+            st.session_state.update({
+                "file_bytes":         file_bytes_new,
+                "file_name":          uploaded.name,
+                "file_hash":          file_hash,
+                "sheet_metas":        metas,
+                "all_cols":           get_all_columns(metas),
+                "q_groups":           q_grps,
+                "selected_indices":   sel_idx,
+                "results":            None,
+                "group_rows_cache":   row_cache,
+                "table_configs":      {},
+            })
 
 # ── STEP 2: Sheet review ──────────────────────────────────────
 if st.session_state["sheet_metas"]:
@@ -488,7 +507,7 @@ if st.session_state["sheet_metas"]:
     for m in metas:
         fmt_counts[m["fmt"]] = fmt_counts.get(m["fmt"], 0) + 1
     fmt_labels = {"fmt2":"Standard","fmt3":"Top Box","fmt4":"Grid Table",
-                  "fmt1":"Legacy","error":"Error"}
+                  "fmt5":"Standard (v2)","fmt1":"Legacy","error":"Error"}
 
     summary = "  ·  ".join([f"**{v}** {fmt_labels.get(k,k)}" for k,v in fmt_counts.items()])
     st.markdown(f"""
@@ -551,6 +570,26 @@ if st.session_state.get("q_groups"):
     with oc4:
         weighted_data = st.toggle("Weighted data", value=False,
             help="Enable if your banner has weighted counts on a separate row.")
+
+    # Heatmap + sig flags row
+    st.markdown("#### 🎨 Visual formatting")
+    vf1, vf2, vf3, vf4 = st.columns(4)
+    with vf1:
+        heatmap_scheme = st.selectbox(
+            "Heatmap",
+            ["None", "Blue scale", "Green scale", "Red-Green diverging", "Custom"],
+            index=0,
+        )
+    with vf2:
+        show_sig_flags = st.toggle("▲/▼ sig flags", value=False,
+            help="Show ▲ if significantly higher than Total, ▼ if significantly lower.")
+    heatmap_custom_start = None
+    heatmap_custom_end   = None
+    if heatmap_scheme == "Custom":
+        with vf3:
+            heatmap_custom_start = st.color_picker("Start color (low)", "#FFF7ED")
+        with vf4:
+            heatmap_custom_end   = st.color_picker("End color (high)", "#1D4ED8")
 
     st.divider()
 
@@ -616,11 +655,11 @@ if st.session_state.get("q_groups"):
                     unsafe_allow_html=True)
             st.markdown("")
 
-            # Lazy-load rows
+            # Rows pre-loaded at scan time — just retrieve from cache
             cache = st.session_state["group_rows_cache"]
             if prefix not in cache:
-                with st.spinner(f"Loading rows for {prefix}…"):
-                    cache[prefix] = scan_rows_for_sheets(file_bytes, sel_in_group)
+                # Fallback: load now if somehow missing
+                cache[prefix] = scan_rows_for_sheets(file_bytes, sel_in_group)
 
             available_rows = cache.get(prefix, [])
             configs = tc[prefix]
@@ -717,14 +756,18 @@ if (
 
         with st.spinner(""):
             results = generate_outputs(
-                file_bytes          = st.session_state["file_bytes"],
-                sheet_table_configs = sheet_table_configs,
-                desired_groups      = selected_cols,
-                output_format       = output_format,
-                excel_mode          = excel_mode,
-                portrait_landscape  = portrait_landscape,
-                weighted_data       = weighted_data,
-                progress_callback   = upd,
+                file_bytes             = st.session_state["file_bytes"],
+                sheet_table_configs    = sheet_table_configs,
+                desired_groups         = selected_cols,
+                output_format          = output_format,
+                excel_mode             = excel_mode,
+                portrait_landscape     = portrait_landscape,
+                weighted_data          = weighted_data,
+                progress_callback      = upd,
+                show_sig_flags         = show_sig_flags,
+                heatmap_scheme         = heatmap_scheme,
+                heatmap_custom_start   = heatmap_custom_start,
+                heatmap_custom_end     = heatmap_custom_end,
             )
         bar.progress(1.0, text="Done!")
         st.session_state["results"] = results
