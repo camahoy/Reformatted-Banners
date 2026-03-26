@@ -108,7 +108,7 @@ if not check_password():
 st.markdown("""
 <div class="app-header">
     <h1>📊 Banner Formatter</h1>
-    <p>Upload · Configure · Download Word or Excel output &nbsp;·&nbsp; <span style="opacity:0.4;font-size:0.75rem">v1.8</span></p>
+    <p>Upload · Configure · Download Word or Excel output &nbsp;·&nbsp; <span style="opacity:0.4;font-size:0.75rem">v1.9</span></p>
 </div>
 """, unsafe_allow_html=True)
 

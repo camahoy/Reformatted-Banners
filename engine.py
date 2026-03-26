@@ -1,10 +1,10 @@
 """
-engine.py — Banner Formatter core logic v1.8
+engine.py — Banner Formatter core logic v1.9
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
 
-print("ENGINE VERSION 1.8 LOADED")
+print("ENGINE VERSION 1.9 LOADED")
 
 import io
 import math
@@ -457,22 +457,31 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
             return None
         return v
 
-    # Find data start: skip header rows (0-6), then skip any base/blank rows
-    # Company rows are identified by having a non-base string in col 0
-    data_start = 8
-    for check in range(7, min(15, len(raw))):
+    # Find data start
+    # Unweighted layout: [label+counts] [%] [sig]  → data_start = first label row
+    # Weighted layout:   [counts] [label+%] [sig]   → data_start = counts row (label - 1)
+    data_start      = 8
+    first_label_row = None
+    for check in range(7, min(16, len(raw))):
         cell = raw[check][0] if raw[check] else None
         if isinstance(cell, str) and cell.strip():
             stripped = cell.strip().lower()
-            # Skip if it's a base label
             if any(stripped.startswith(b) for b in base_starters):
                 continue
-            # Skip end markers
             if stripped in end_markers:
                 break
-            # First non-base, non-empty string — this is where companies start
-            data_start = check
+            first_label_row = check
             break
+
+    if first_label_row is not None:
+        # Check if row before label has numeric data → weighted layout
+        prev = raw[first_label_row - 1] if first_label_row > 0 else []
+        has_prev_nums = any(
+            isinstance(prev[j], (int, float)) and
+            not (isinstance(prev[j], float) and math.isnan(prev[j]))
+            for j in col_indices if j < len(prev)
+        ) if prev else False
+        data_start = (first_label_row - 1) if has_prev_nums else first_label_row
 
     companies     = []
     company_bases = []
@@ -480,37 +489,37 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
 
     i = data_start
     while i < len(raw):
-        label = raw[i][0]
-        if not isinstance(label, str) or not label.strip():
+        row0 = raw[i]
+        row1 = raw[i + 1] if i + 1 < len(raw) else []
+        row2 = raw[i + 2] if i + 2 < len(raw) else []
+
+        label0 = row0[0] if row0 else None
+        label1 = row1[0] if row1 else None
+
+        # Determine which row has the company label
+        if isinstance(label1, str) and label1.strip() and not any(
+            label1.strip().lower().startswith(b) for b in base_starters
+        ) and label1.strip().lower() not in end_markers:
+            # Weighted layout: row0=counts, row1=label+%, row2=sig
+            label_clean = label1.strip()
+            if label_clean.lower() in end_markers:
+                break
+            companies.append(label_clean)
+            company_bases.append([get_val(row0, j) for j in col_indices])
+            data.append([get_val(row1, j) for j in col_indices])
+        elif isinstance(label0, str) and label0.strip() and not any(
+            label0.strip().lower().startswith(b) for b in base_starters
+        ) and label0.strip().lower() not in end_markers:
+            # Unweighted layout: row0=label+counts, row1=%, row2=sig
+            label_clean = label0.strip()
+            companies.append(label_clean)
+            company_bases.append([get_val(row0, j) for j in col_indices])
+            data.append([get_val(row1, j) for j in col_indices])
+        elif isinstance(label0, str) and label0.strip().lower() in end_markers:
+            break
+        else:
             i += 1
             continue
-        label_clean = label.strip()
-        if label_clean.lower() in end_markers:
-            break
-
-        companies.append(label_clean)
-        label_row = raw[i]
-        next_row  = raw[i + 1] if i + 1 < len(raw) else []
-
-        # Detect layout:
-        # Unweighted fmt3: label row has counts (integers), next row has %
-        # Weighted fmt3:   label row has % (decimals 0-1), next row has sig letters
-        # Check if col 1 of label row is a decimal (%) or integer (count)
-        sample_val = None
-        for j in col_indices:
-            v = get_val(label_row, j)
-            if v is not None and isinstance(v, (int, float)):
-                sample_val = v
-                break
-
-        if sample_val is not None and isinstance(sample_val, float) and 0 <= sample_val <= 1:
-            # % is already on the label row (weighted fmt3)
-            company_bases.append([get_val(next_row, j) for j in col_indices])
-            data.append([get_val(label_row, j) for j in col_indices])
-        else:
-            # Counts on label row, % on next row (unweighted fmt3)
-            company_bases.append([get_val(label_row, j) for j in col_indices])
-            data.append([get_val(next_row, j) for j in col_indices])
         i += 3
 
     return {
