@@ -11,7 +11,6 @@ from engine import (
     scan_multi_source, generate_merged_outputs,
 )
 
-
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
     page_title="Banner Formatter",
@@ -109,7 +108,7 @@ if not check_password():
 st.markdown("""
 <div class="app-header">
     <h1>📊 Banner Formatter</h1>
-    <p>Upload · Configure · Download Word or Excel output &nbsp;·&nbsp; <span style="opacity:0.4;font-size:0.75rem">v1.4</span></p>
+    <p>Upload · Configure · Download Word or Excel output &nbsp;·&nbsp; <span style="opacity:0.4;font-size:0.75rem">v1.8</span></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -140,6 +139,7 @@ show_sig_flags       = False
 heatmap_scheme       = "None"
 heatmap_custom_start = None
 heatmap_custom_end   = None
+use_weighted_base    = False
 
 # ── Mode toggle ───────────────────────────────────────────────
 st.markdown("""
@@ -578,6 +578,11 @@ if st.session_state.get("q_groups"):
     with oc4:
         weighted_data = st.toggle("Weighted data", value=False,
             help="Enable if your banner has weighted counts on a separate row.")
+        if weighted_data:
+            use_weighted_base = st.toggle("Weighted N= in header", value=True,
+                help="On = show weighted base (e.g. 7,000) in column headers. Off = show unweighted base (e.g. 7,020).")
+        else:
+            use_weighted_base = False
 
     # Heatmap + sig flags row
     st.markdown("#### 🎨 Visual formatting")
@@ -771,6 +776,7 @@ if (
                 excel_mode             = excel_mode,
                 portrait_landscape     = portrait_landscape,
                 weighted_data          = weighted_data,
+                use_weighted_base      = use_weighted_base,
                 progress_callback      = upd,
                 show_sig_flags         = show_sig_flags,
                 heatmap_scheme         = heatmap_scheme,

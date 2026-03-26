@@ -1,8 +1,10 @@
 """
-engine.py — Banner Formatter core logic v1.5
+engine.py — Banner Formatter core logic v1.8
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
+
+print("ENGINE VERSION 1.8 LOADED")
 
 import io
 import math
@@ -16,7 +18,6 @@ from docx.enum.table import WD_ALIGN_VERTICAL
 import openpyxl
 from openpyxl.styles import Font as XLFont, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
-
 
 
 # ── Helper functions ─────────────────────────────────────────
@@ -334,7 +335,16 @@ def _select_cols(all_cols, desired_groups, sublabel_filter='total'):
     return selected
 
 
-def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False):
+def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False, weighted_base=None):
+    """
+    weighted_data: affects data_start (how many base rows to skip before answers)
+    weighted_base: which base row to use for N= display
+                   None = same as weighted_data
+                   True = use weighted base (row base_row_idx + 2)
+                   False = use unweighted base (row base_row_idx + 0)
+    """
+    if weighted_base is None:
+        weighted_base = weighted_data
     raw = sheet_df.values.tolist()
     question_wording = str(raw[2][0]).strip() if raw[2][0] else ''
 
@@ -366,17 +376,18 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False):
                 base_row_idx = i
                 break
 
-    # For weighted data: Unweighted Base is at base_row_idx, weighted at base_row_idx+2
-    # For unweighted: Base: Total Answering is at base_row_idx, counts on same row (offset 0)
-    base_offset   = 2 if weighted_data else 0
+    # Base display: use weighted_base to pick which row to show in N=
+    # weighted_base=True  → weighted count (row +2 from unweighted base row)
+    # weighted_base=False → unweighted count (row +0, same row as label)
+    base_offset   = 2 if weighted_base else 0
     base_values   = []
     if base_row_idx is not None:
         base_data_row = raw[base_row_idx + base_offset] if base_row_idx + base_offset < len(raw) else []
         base_values   = [base_data_row[j] if j < len(base_data_row) else None for j in col_indices]
 
-    # Data starts after both base rows
-    # Weighted: unweighted(row 7) + blank(8) + weighted(9) + blank(10) = data at row 11 → base_rows_used=4
-    # Unweighted: base(row 7) + blank(8) = data at row 9 → base_rows_used=2
+    # Data start: skip both base rows when weighted_data=True
+    # weighted_data=True:  unweighted(+0) + blank(+1) + weighted(+2) + blank(+3) = data at +4
+    # weighted_data=False: base(+0) + blank(+1) = data at +2
     base_rows_used = 4 if weighted_data else 2
     data_start = (base_row_idx + base_rows_used) if base_row_idx is not None else 9
 
@@ -433,7 +444,8 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
     col_indices   = [j for (j, g, s) in selected_cols]
     col_labels    = [(g, s) for (j, g, s) in selected_cols]
 
-    end_markers = {'overlap formula used', 'sigma'}
+    end_markers   = {'overlap formula used', 'sigma'}
+    base_starters = {'base', 'unweighted', 'weighted base'}
 
     def get_val(row, j):
         v = row[j] if j < len(row) else None
@@ -445,11 +457,28 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
             return None
         return v
 
+    # Find data start: skip header rows (0-6), then skip any base/blank rows
+    # Company rows are identified by having a non-base string in col 0
+    data_start = 8
+    for check in range(7, min(15, len(raw))):
+        cell = raw[check][0] if raw[check] else None
+        if isinstance(cell, str) and cell.strip():
+            stripped = cell.strip().lower()
+            # Skip if it's a base label
+            if any(stripped.startswith(b) for b in base_starters):
+                continue
+            # Skip end markers
+            if stripped in end_markers:
+                break
+            # First non-base, non-empty string — this is where companies start
+            data_start = check
+            break
+
     companies     = []
     company_bases = []
     data          = []
 
-    i = 8
+    i = data_start
     while i < len(raw):
         label = raw[i][0]
         if not isinstance(label, str) or not label.strip():
@@ -458,11 +487,30 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
         label_clean = label.strip()
         if label_clean.lower() in end_markers:
             break
+
         companies.append(label_clean)
-        base_row = raw[i]
-        pct_row  = raw[i + 1] if i + 1 < len(raw) else []
-        company_bases.append([get_val(base_row, j) for j in col_indices])
-        data.append([get_val(pct_row,  j) for j in col_indices])
+        label_row = raw[i]
+        next_row  = raw[i + 1] if i + 1 < len(raw) else []
+
+        # Detect layout:
+        # Unweighted fmt3: label row has counts (integers), next row has %
+        # Weighted fmt3:   label row has % (decimals 0-1), next row has sig letters
+        # Check if col 1 of label row is a decimal (%) or integer (count)
+        sample_val = None
+        for j in col_indices:
+            v = get_val(label_row, j)
+            if v is not None and isinstance(v, (int, float)):
+                sample_val = v
+                break
+
+        if sample_val is not None and isinstance(sample_val, float) and 0 <= sample_val <= 1:
+            # % is already on the label row (weighted fmt3)
+            company_bases.append([get_val(next_row, j) for j in col_indices])
+            data.append([get_val(label_row, j) for j in col_indices])
+        else:
+            # Counts on label row, % on next row (unweighted fmt3)
+            company_bases.append([get_val(label_row, j) for j in col_indices])
+            data.append([get_val(next_row, j) for j in col_indices])
         i += 3
 
     return {
@@ -523,7 +571,9 @@ def parse_fmt4_sheet(sheet_df):
     }
 
 
-def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False):
+def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False, weighted_base=None):
+    if weighted_base is None:
+        weighted_base = weighted_data
     """
     Parses the variant banner format where:
       Row 0  : project ID
@@ -565,8 +615,8 @@ def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False):
     # Base values:
     # Row 8  = Unweighted Base
     # Row 10 = Base: Total Answering (weighted)
-    # Use weighted if weighted_data=True, else unweighted
-    base_row_idx = 10 if weighted_data else 8
+    # Use weighted_base to control which N= shows in headers
+    base_row_idx = 10 if weighted_base else 8
     base_row     = raw[base_row_idx] if len(raw) > base_row_idx else []
     base_values  = [base_row[j] if j < len(base_row) else None for j in col_indices]
 
@@ -934,12 +984,17 @@ def generate_outputs(
     excel_mode,
     portrait_landscape,
     weighted_data,
+    use_weighted_base=None,  # None = same as weighted_data; True/False = override base row
     progress_callback=None,
     show_sig_flags=False,
     heatmap_scheme="None",
     heatmap_custom_start=None,
     heatmap_custom_end=None,
 ):
+    # use_weighted_base controls which base row to show in N=
+    # If None, defaults to same as weighted_data
+    if use_weighted_base is None:
+        use_weighted_base = weighted_data
     """
     Core generation function called by the Streamlit app.
     sheet_table_configs: list of (sheet_index, row_filter) tuples.
@@ -1021,10 +1076,6 @@ def generate_outputs(
         if progress_callback:
             progress_callback(idx / total, f"Processing sheet {sheet_idx}…")
 
-        # Excel sheet key: use group_prefix in per_question mode so all
-        # sub-questions in a group land on the same sheet
-        xl_sheet_key = (group_prefix or xl.sheet_names[sheet_idx])[:31]
-
         try:
             sheet_name  = xl.sheet_names[sheet_idx]
             sheet_label = sheet_name[:31]
@@ -1036,9 +1087,28 @@ def generate_outputs(
                 parsed_cache[sheet_idx] = (df, fmt)
             sheet_df, fmt = parsed_cache[sheet_idx]
 
+            # Build xl_sheet_key from question wording for readable sheet names
+            # Use group_prefix if provided, otherwise extract from question wording
+            if group_prefix:
+                xl_sheet_key = group_prefix[:31]
+            else:
+                # Try to get question wording from raw data
+                try:
+                    raw_preview = sheet_df.values.tolist()
+                    wording_row = 3 if fmt == 'fmt5' else 2
+                    wording = str(raw_preview[wording_row][0]).strip() if (
+                        len(raw_preview) > wording_row and raw_preview[wording_row][0]
+                    ) else sheet_name
+                    # Clean up: remove special chars that Excel doesn't allow in sheet names
+                    import re as _re
+                    clean = _re.sub(r'[\\/*?\[\]:]', '', wording)[:31].strip()
+                    xl_sheet_key = clean if clean else sheet_name[:31]
+                except Exception:
+                    xl_sheet_key = sheet_name[:31]
+
             # ── fmt2 ─────────────────────────────────────────
             if fmt == 'fmt2':
-                parsed  = parse_fmt2_sheet(sheet_df, desired_groups, weighted_data)
+                parsed  = parse_fmt2_sheet(sheet_df, desired_groups, weighted_data, weighted_base=use_weighted_base)
                 if not parsed['answers']:
                     skipped.append(sheet_label)
                     continue
@@ -1076,7 +1146,7 @@ def generate_outputs(
 
             # ── fmt5 ─────────────────────────────────────────
             elif fmt == 'fmt5':
-                parsed = parse_fmt5_sheet(sheet_df, desired_groups, weighted_data)
+                parsed = parse_fmt5_sheet(sheet_df, desired_groups, weighted_data, weighted_base=use_weighted_base)
                 if not parsed['answers']:
                     skipped.append(sheet_label)
                     continue
