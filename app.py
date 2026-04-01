@@ -108,7 +108,7 @@ if not check_password():
 st.markdown("""
 <div class="app-header">
     <h1>📊 Banner Formatter</h1>
-    <p>Upload · Configure · Download Word or Excel output &nbsp;·&nbsp; <span style="opacity:0.4;font-size:0.75rem">v2.1</span></p>
+    <p>Upload · Configure · Download Word or Excel output &nbsp;·&nbsp; <span style="opacity:0.4;font-size:0.75rem">v2.2</span></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -488,13 +488,6 @@ if uploaded:
             q_grps  = get_question_groups(metas)
             sel_idx = [m["index"] for m in metas if m["fmt"] != "error"]
 
-            # Pre-load row labels for every group so custom selection works immediately
-            row_cache = {}
-            for grp in q_grps:
-                grp_indices = [s["index"] for s in grp["sheets"] if s["index"] in sel_idx]
-                if grp_indices:
-                    row_cache[grp["prefix"]] = scan_rows_for_sheets(file_bytes_new, grp_indices)
-
             st.session_state.update({
                 "file_bytes":         file_bytes_new,
                 "file_name":          uploaded.name,
@@ -504,7 +497,7 @@ if uploaded:
                 "q_groups":           q_grps,
                 "selected_indices":   sel_idx,
                 "results":            None,
-                "group_rows_cache":   row_cache,
+                "group_rows_cache":   {},   # loaded on demand when expander opens
                 "table_configs":      {},
             })
 
@@ -668,11 +661,12 @@ if st.session_state.get("q_groups"):
                     unsafe_allow_html=True)
             st.markdown("")
 
-            # Rows pre-loaded at scan time — just retrieve from cache
+            # Rows loaded on demand when expander opens
             cache = st.session_state["group_rows_cache"]
             if prefix not in cache:
-                # Fallback: load now if somehow missing
-                cache[prefix] = scan_rows_for_sheets(file_bytes, sel_in_group)
+                with st.spinner(f"Loading rows for {prefix}…"):
+                    cache[prefix] = scan_rows_for_sheets(file_bytes, sel_in_group)
+                st.session_state["group_rows_cache"] = cache
 
             available_rows = cache.get(prefix, [])
             configs = tc[prefix]

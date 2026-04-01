@@ -1,10 +1,10 @@
 """
-engine.py — Banner Formatter core logic v2.1
+engine.py — Banner Formatter core logic v2.2
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
 
-print("ENGINE VERSION 2.1 LOADED")
+print("ENGINE VERSION 2.2 LOADED")
 
 import io
 import math
