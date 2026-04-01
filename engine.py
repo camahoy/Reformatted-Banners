@@ -1,10 +1,10 @@
 """
-engine.py — Banner Formatter core logic v1.9
+engine.py — Banner Formatter core logic v2.1
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
 
-print("ENGINE VERSION 1.9 LOADED")
+print("ENGINE VERSION 2.1 LOADED")
 
 import io
 import math
@@ -72,6 +72,24 @@ def detect_format(sheet_df):
     fmt1 = original transposed format (legacy / per-country)
     """
     raw = sheet_df.values.tolist()
+
+    # fmt6: like fmt5 but with extra descriptor row at position 2
+    # Signature: row 2 col 0 is a short label (not a question), row 3 col 0 is question,
+    #            row 4 col 1 = 'Total', row 5 col 1 = category name
+    try:
+        row2_col0 = raw[2][0]
+        row3_col0 = raw[3][0]
+        row4_col1 = raw[4][1]
+        row5_col1 = raw[5][1]
+        if (
+            isinstance(row3_col0, str) and len(row3_col0.strip()) > 5
+            and isinstance(row4_col1, str) and 'total' in row4_col1.lower()
+            and isinstance(row5_col1, str) and row5_col1.strip()
+            and (not isinstance(row2_col0, str) or len(row2_col0.strip()) < 50)
+        ):
+            return 'fmt6'
+    except (IndexError, TypeError):
+        pass
 
     # fmt5: question at row 3, categories at row 5, two base rows (unweighted + weighted)
     # Signature: row 3 col 0 has question wording, row 4 col 1 has 'Total',
@@ -153,8 +171,8 @@ def scan_file(file_bytes):
             df  = xl.parse(i, header=None, na_values=[''])
             fmt = detect_format(df)
             raw = df.values.tolist()
-            # Question wording: fmt5 has it at row 3, others at row 2
-            if fmt == 'fmt5':
+            # Question wording: fmt5/fmt6 have it at row 3, others at row 2
+            if fmt in ('fmt5', 'fmt6'):
                 question_wording = str(raw[3][0]).strip() if (
                     len(raw) > 3 and raw[3] and raw[3][0]
                 ) else sheet_name
@@ -174,6 +192,12 @@ def scan_file(file_bytes):
                     if isinstance(g, str) and g.strip():
                         columns.append((g.strip(), s.strip() if isinstance(s, str) else ''))
             elif fmt == 'fmt5':
+                cat_row = raw[5] if len(raw) > 5 else []
+                for j in range(1, len(cat_row)):
+                    g = cat_row[j]
+                    if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
+                        columns.append((g.strip(), ''))
+            elif fmt == 'fmt6':
                 cat_row = raw[5] if len(raw) > 5 else []
                 for j in range(1, len(cat_row)):
                     g = cat_row[j]
@@ -212,7 +236,7 @@ def get_all_columns(sheet_metas):
     seen = set()
     cols = []
     for s in sheet_metas:
-        if s['fmt'] in ('fmt2', 'fmt3', 'fmt5'):
+        if s['fmt'] in ('fmt2', 'fmt3', 'fmt5', 'fmt6'):
             for col in s['columns']:
                 if col[0] not in seen:
                     seen.add(col[0])
@@ -252,8 +276,8 @@ def scan_rows_for_sheets(file_bytes, sheet_indices):
                             seen.add(clean)
                             rows.append(clean)
                     j += 3
-            elif fmt == 'fmt5':
-                # fmt5 data starts at row 12
+            elif fmt in ('fmt5', 'fmt6'):
+                # fmt5/fmt6 data starts at row 12
                 j = 12
                 while j < len(raw):
                     label = raw[j][0]
@@ -428,6 +452,24 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False, weighte
 
 
 def parse_fmt3_sheet(sheet_df, desired_groups=None):
+    """
+    Handles two confirmed fmt3 layouts:
+
+    Unweighted (original):
+      Row 7:  Base label + counts (same row)
+      Row 8:  blank
+      Row 9+: [company + counts] [%] [sig]  every 3 rows
+
+    Weighted:
+      Row 7:  Unweighted Base + counts
+      Row 8:  blank
+      Row 9:  Base: ... label (no counts on this row)
+      Row 10: blank
+      Row 11: counts (no label)
+      Row 12: company label + % values
+      Row 13: sig letters
+      Pattern: [counts] [label+%] [sig]  every 3 rows, starting at row 11
+    """
     raw = sheet_df.values.tolist()
     question_wording = str(raw[2][0]).strip() if raw[2][0] else ''
 
@@ -444,8 +486,7 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
     col_indices   = [j for (j, g, s) in selected_cols]
     col_labels    = [(g, s) for (j, g, s) in selected_cols]
 
-    end_markers   = {'overlap formula used', 'sigma'}
-    base_starters = {'base', 'unweighted', 'weighted base'}
+    end_markers = {'overlap formula used', 'sigma'}
 
     def get_val(row, j):
         v = row[j] if j < len(row) else None
@@ -457,31 +498,45 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
             return None
         return v
 
-    # Find data start
-    # Unweighted layout: [label+counts] [%] [sig]  → data_start = first label row
-    # Weighted layout:   [counts] [label+%] [sig]   → data_start = counts row (label - 1)
-    data_start      = 8
-    first_label_row = None
-    for check in range(7, min(16, len(raw))):
-        cell = raw[check][0] if raw[check] else None
-        if isinstance(cell, str) and cell.strip():
-            stripped = cell.strip().lower()
-            if any(stripped.startswith(b) for b in base_starters):
-                continue
-            if stripped in end_markers:
-                break
-            first_label_row = check
-            break
+    def is_numeric(v):
+        return isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v))
 
-    if first_label_row is not None:
-        # Check if row before label has numeric data → weighted layout
-        prev = raw[first_label_row - 1] if first_label_row > 0 else []
-        has_prev_nums = any(
-            isinstance(prev[j], (int, float)) and
-            not (isinstance(prev[j], float) and math.isnan(prev[j]))
-            for j in col_indices if j < len(prev)
-        ) if prev else False
-        data_start = (first_label_row - 1) if has_prev_nums else first_label_row
+    def row_has_nums(row):
+        return any(is_numeric(row[j]) for j in col_indices if j < len(row))
+
+    def row_has_label(row):
+        c = row[0] if row else None
+        return isinstance(c, str) and c.strip()
+
+    # Detect layout by scanning from row 7 onwards
+    # Find first row that has numeric data in the data columns
+    # Then check if the NEXT row has a company label (weighted) or
+    # if THIS row has a company label (unweighted)
+    weighted_fmt3 = False
+    data_start    = 8
+
+    for check in range(7, min(16, len(raw))):
+        row = raw[check]
+        label = row[0] if row else None
+        # Skip base/blank rows
+        if not isinstance(label, str) or not label.strip():
+            continue
+        stripped = label.strip().lower()
+        if stripped.startswith('base') or stripped.startswith('unweighted'):
+            continue
+        if stripped in end_markers:
+            break
+        # This row has a company label — check if PREVIOUS row had numbers
+        prev = raw[check - 1] if check > 0 else []
+        if row_has_nums(prev):
+            # Weighted: counts are on prev row, label+% on this row
+            weighted_fmt3 = True
+            data_start    = check - 1
+        else:
+            # Unweighted: label+counts on this row
+            weighted_fmt3 = False
+            data_start    = check
+        break
 
     companies     = []
     company_bases = []
@@ -489,38 +544,36 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
 
     i = data_start
     while i < len(raw):
-        row0 = raw[i]
-        row1 = raw[i + 1] if i + 1 < len(raw) else []
-        row2 = raw[i + 2] if i + 2 < len(raw) else []
-
-        label0 = row0[0] if row0 else None
-        label1 = row1[0] if row1 else None
-
-        # Determine which row has the company label
-        if isinstance(label1, str) and label1.strip() and not any(
-            label1.strip().lower().startswith(b) for b in base_starters
-        ) and label1.strip().lower() not in end_markers:
-            # Weighted layout: row0=counts, row1=label+%, row2=sig
-            label_clean = label1.strip()
+        if weighted_fmt3:
+            # [counts row i] [label+% row i+1] [sig row i+2]
+            counts_row = raw[i]
+            label_row  = raw[i + 1] if i + 1 < len(raw) else []
+            label      = label_row[0] if label_row else None
+            if not isinstance(label, str) or not label.strip():
+                i += 1
+                continue
+            label_clean = label.strip()
             if label_clean.lower() in end_markers:
                 break
             companies.append(label_clean)
-            company_bases.append([get_val(row0, j) for j in col_indices])
-            data.append([get_val(row1, j) for j in col_indices])
-        elif isinstance(label0, str) and label0.strip() and not any(
-            label0.strip().lower().startswith(b) for b in base_starters
-        ) and label0.strip().lower() not in end_markers:
-            # Unweighted layout: row0=label+counts, row1=%, row2=sig
-            label_clean = label0.strip()
-            companies.append(label_clean)
-            company_bases.append([get_val(row0, j) for j in col_indices])
-            data.append([get_val(row1, j) for j in col_indices])
-        elif isinstance(label0, str) and label0.strip().lower() in end_markers:
-            break
+            company_bases.append([get_val(counts_row, j) for j in col_indices])
+            data.append([get_val(label_row, j) for j in col_indices])
+            i += 3
         else:
-            i += 1
-            continue
-        i += 3
+            # [label+counts row i] [% row i+1] [sig row i+2]
+            label_row = raw[i]
+            label     = label_row[0] if label_row else None
+            if not isinstance(label, str) or not label.strip():
+                i += 1
+                continue
+            label_clean = label.strip()
+            if label_clean.lower() in end_markers:
+                break
+            pct_row = raw[i + 1] if i + 1 < len(raw) else []
+            companies.append(label_clean)
+            company_bases.append([get_val(label_row, j) for j in col_indices])
+            data.append([get_val(pct_row, j) for j in col_indices])
+            i += 3
 
     return {
         'question_wording': question_wording,
@@ -530,6 +583,7 @@ def parse_fmt3_sheet(sheet_df, desired_groups=None):
         'answers':          companies,
         'data':             data,
     }
+
 
 
 def parse_fmt4_sheet(sheet_df):
@@ -675,7 +729,96 @@ def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False, weighte
     }
 
 
-# ── Heatmap & stat sig helpers ───────────────────────────────
+def parse_fmt6_sheet(sheet_df, desired_groups=None, weighted_data=False, weighted_base=None):
+    """
+    Like fmt5 but with an extra descriptor row at position 2.
+      Row 0  : project ID
+      Row 1  : weight note
+      Row 2  : descriptor (e.g. 'Total sample', short label — NOT the question)
+      Row 3  : question wording (col 0)
+      Row 4  : group names (col 1+)
+      Row 5  : category names (col 1+)
+      Row 6  : letter codes
+      Row 7  : blank
+      Row 8  : Unweighted Base label (no counts on same row for blank template)
+               OR Unweighted Base + counts (populated file)
+      Row 9  : blank
+      Row 10 : Base: Total Answering label / counts
+      Row 11 : blank
+      Row 12+: answer data, every 3 rows
+    """
+    if weighted_base is None:
+        weighted_base = weighted_data
+
+    raw = sheet_df.values.tolist()
+
+    question_wording = str(raw[3][0]).strip() if (len(raw) > 3 and raw[3][0]) else ''
+
+    # Categories at row 5
+    cat_row  = raw[5] if len(raw) > 5 else []
+    all_cols = []
+    for j in range(1, len(cat_row)):
+        g = cat_row[j]
+        if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
+            all_cols.append((j, g.strip(), ''))
+
+    if desired_groups is not None:
+        desired_lower = {d.lower() for d in desired_groups}
+        selected_cols = [(j, g, s) for (j, g, s) in all_cols if g.lower() in desired_lower]
+    else:
+        selected_cols = all_cols
+
+    col_indices = [j for (j, g, s) in selected_cols]
+    col_labels  = [(g, s) for (j, g, s) in selected_cols]
+
+    # Base values: row 8 = unweighted, row 10 = weighted
+    base_row_idx = 10 if weighted_base else 8
+    base_row     = raw[base_row_idx] if len(raw) > base_row_idx else []
+    base_values  = [base_row[j] if j < len(base_row) else None for j in col_indices]
+
+    # Letter codes at row 6
+    letter_row  = raw[6] if len(raw) > 6 else []
+    col_letters = [letter_row[j] if j < len(letter_row) else None for j in col_indices]
+
+    # Answers start at row 12, every 3 rows
+    answers  = []
+    data     = []
+    sig_data = []
+    i = 12
+    while i < len(raw):
+        label = raw[i][0]
+        if isinstance(label, str) and label.strip():
+            label_clean = label.strip()
+            if label_clean.lower() == 'sigma':
+                break
+            answers.append(label_clean)
+            pct_row = raw[i + 1] if i + 1 < len(raw) else []
+            sig_row = raw[i + 2] if i + 2 < len(raw) else []
+            row_vals = []
+            sig_vals = []
+            for j in col_indices:
+                v = pct_row[j] if j < len(pct_row) else None
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    row_vals.append(None)
+                elif isinstance(v, str) and v.strip() in ('-', '', '\xa0'):
+                    row_vals.append(None)
+                else:
+                    row_vals.append(v)
+                sv = sig_row[j] if j < len(sig_row) else None
+                sig_vals.append(sv if isinstance(sv, str) else None)
+            data.append(row_vals)
+            sig_data.append(sig_vals)
+        i += 3
+
+    return {
+        'question_wording': question_wording,
+        'columns':          col_labels,
+        'base_values':      base_values,
+        'answers':          answers,
+        'data':             data,
+        'sig_data':         sig_data,
+        'col_letters':      col_letters,
+    }
 
 def _hex_to_rgb(hex_color):
     h = hex_color.lstrip('#')
@@ -1086,7 +1229,13 @@ def generate_outputs(
             progress_callback(idx / total, f"Processing sheet {sheet_idx}…")
 
         try:
-            sheet_name  = xl.sheet_names[sheet_idx]
+            # sheet_idx can be an integer (position) or string (sheet name)
+            if isinstance(sheet_idx, str):
+                # Find position by name
+                sheet_name = sheet_idx
+                sheet_idx  = xl.sheet_names.index(sheet_idx)
+            else:
+                sheet_name = xl.sheet_names[sheet_idx]
             sheet_label = sheet_name[:31]
 
             # Parse once per sheet, cache result
@@ -1190,6 +1339,45 @@ def generate_outputs(
                         heatmap_custom_end=heatmap_custom_end,
                     )
                     _xl_done(ws, xl_sheet_key, nr)
+
+            # ── fmt6 ─────────────────────────────────────────
+            elif fmt == 'fmt6':
+                parsed = parse_fmt6_sheet(sheet_df, desired_groups, weighted_data, weighted_base=use_weighted_base)
+                if not parsed['answers']:
+                    skipped.append(sheet_label)
+                    continue
+
+                col_labels, answers, data, flags = _prep_fmt2_fmt5(
+                    parsed, row_filter, show_sig_flags)
+                if not answers:
+                    skipped.append(sheet_label)
+                    continue
+
+                if word_doc is not None:
+                    write_table_to_doc(
+                        word_doc, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, first_word,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
+                    )
+                    first_word = False
+
+                if xl_wb is not None:
+                    ws, row_num = _xl_get_sheet(xl_sheet_key)
+                    nr = _xl_write_table(
+                        ws, row_num, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, True,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
+                    )
+                    _xl_done(ws, xl_sheet_key, nr)
+
             elif fmt == 'fmt3':
                 parsed     = parse_fmt3_sheet(sheet_df, desired_groups)
                 if not parsed['answers']:
@@ -1346,7 +1534,7 @@ def generate_outputs(
                 skipped.append(f"{sheet_label} (fmt1/grid — skipped)")
 
         except Exception as e:
-            errors.append((xl.sheet_names[sheet_idx], str(e)))
+            errors.append((sheet_name if 'sheet_name' in dir() else str(sheet_idx), str(e)))
 
     if progress_callback:
         progress_callback(1.0, "Finalizing…")
