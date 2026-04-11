@@ -1,10 +1,10 @@
 """
-engine.py — Banner Formatter core logic v2.2
+engine.py — Banner Formatter core logic v2.3
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
 
-print("ENGINE VERSION 2.2 LOADED")
+print("ENGINE VERSION 2.3 LOADED")
 
 import io
 import math
@@ -165,8 +165,18 @@ def scan_file(file_bytes):
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
     results = []
     for i, sheet_name in enumerate(xl.sheet_names):
+        # Skip sheet 0 only if it looks like a table of contents
+        # (name is 'Index', 'TOC', 'Contents', or has only 1 column of data)
         if i == 0:
-            continue   # skip table of contents
+            try:
+                df0 = xl.parse(0, header=None, na_values=[''])
+                fmt0 = detect_format(df0)
+                # If sheet 0 is a real data format, include it
+                if fmt0 == 'fmt1':
+                    continue  # likely TOC/index
+                # Otherwise fall through and process it
+            except Exception:
+                continue
         try:
             df  = xl.parse(i, header=None, na_values=[''])
             fmt = detect_format(df)
