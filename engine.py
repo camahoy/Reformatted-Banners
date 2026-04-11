@@ -1,10 +1,10 @@
 """
-engine.py — Banner Formatter core logic v2.3
+engine.py — Banner Formatter core logic v2.4
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
 
-print("ENGINE VERSION 2.3 LOADED")
+print("ENGINE VERSION 2.4 LOADED")
 
 import io
 import math
@@ -125,6 +125,26 @@ def detect_format(sheet_df):
     except (IndexError, TypeError):
         pass
 
+    # fmt7: weighted banner with group header row
+    # Row 2: question wording
+    # Row 3: group names (Gender, Generation...) — col 1 may be blank
+    # Row 4: category names (Total, Male, Female...) — col 1 = 'Total'
+    # Row 5: letter codes
+    # Row 7: Unweighted Base + counts
+    # Row 9: Base: Total Answering + weighted counts
+    try:
+        row2_col0 = raw[2][0]
+        row4_col1 = raw[4][1]
+        row7_col0 = raw[7][0] if len(raw) > 7 else None
+        if (
+            isinstance(row2_col0, str) and len(row2_col0.strip()) > 10
+            and isinstance(row4_col1, str) and 'total' in row4_col1.lower()
+            and isinstance(row7_col0, str) and row7_col0.strip().lower().startswith('unweighted')
+        ):
+            return 'fmt7'
+    except (IndexError, TypeError):
+        pass
+
     # fmt2 / fmt3: row 3 col 1 = 'Total', row 4 = sub-labels
     try:
         row2_col0 = raw[2][0]
@@ -213,6 +233,12 @@ def scan_file(file_bytes):
                     g = cat_row[j]
                     if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
                         columns.append((g.strip(), ''))
+            elif fmt == 'fmt7':
+                cat_row = raw[4] if len(raw) > 4 else []
+                for j in range(1, len(cat_row)):
+                    g = cat_row[j]
+                    if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
+                        columns.append((g.strip(), ''))
             elif fmt == 'fmt4':
                 brand_row = raw[4] if len(raw) > 4 else []
                 for j in range(1, len(brand_row)):
@@ -246,7 +272,7 @@ def get_all_columns(sheet_metas):
     seen = set()
     cols = []
     for s in sheet_metas:
-        if s['fmt'] in ('fmt2', 'fmt3', 'fmt5', 'fmt6'):
+        if s['fmt'] in ('fmt2', 'fmt3', 'fmt5', 'fmt6', 'fmt7'):
             for col in s['columns']:
                 if col[0] not in seen:
                     seen.add(col[0])
@@ -286,9 +312,9 @@ def scan_rows_for_sheets(file_bytes, sheet_indices):
                             seen.add(clean)
                             rows.append(clean)
                     j += 3
-            elif fmt in ('fmt5', 'fmt6'):
-                # fmt5/fmt6 data starts at row 12
-                j = 12
+            elif fmt in ('fmt5', 'fmt6', 'fmt7'):
+                # fmt5/fmt6/fmt7 data starts at row 11-12
+                j = 11
                 while j < len(raw):
                     label = raw[j][0]
                     if isinstance(label, str) and label.strip():
@@ -830,6 +856,99 @@ def parse_fmt6_sheet(sheet_df, desired_groups=None, weighted_data=False, weighte
         'col_letters':      col_letters,
     }
 
+
+def parse_fmt7_sheet(sheet_df, desired_groups=None, weighted_data=False, weighted_base=None):
+    """
+    fmt7: weighted banner with extra group header row.
+    Row 2: question wording
+    Row 3: group names (Gender, Generation...) — may have blanks
+    Row 4: category names (Total, Male, Female...) — col 1 = Total
+    Row 5: letter codes
+    Row 7: Unweighted Base + counts
+    Row 9: Base: Total Answering + weighted counts
+    Row 10+: data every 3 rows
+    """
+    if weighted_base is None:
+        weighted_base = weighted_data
+
+    raw = sheet_df.values.tolist()
+    question_wording = str(raw[2][0]).strip() if (len(raw) > 2 and raw[2][0]) else ""
+
+    # Categories at row 4
+    cat_row = raw[4] if len(raw) > 4 else []
+    all_cols = []
+    for j in range(1, len(cat_row)):
+        g = cat_row[j]
+        if isinstance(g, str) and g.strip() and g.strip() != "\xa0":
+            all_cols.append((j, g.strip(), ""))
+
+    if desired_groups is not None:
+        desired_lower = {d.lower() for d in desired_groups}
+        selected_cols = [(j, g, s) for (j, g, s) in all_cols if g.lower() in desired_lower]
+    else:
+        selected_cols = [(j, g, s) for (j, g, s) in all_cols if True]
+
+    col_indices = [j for (j, g, s) in selected_cols]
+    col_labels  = [(g, s) for (j, g, s) in selected_cols]
+
+    # Base rows: 7 = unweighted, 9 = weighted
+    base_offset   = 2 if weighted_base else 0
+    base_row_idx  = 7
+    base_data_row = raw[base_row_idx + base_offset] if base_row_idx + base_offset < len(raw) else []
+    base_values   = [base_data_row[j] if j < len(base_data_row) else None for j in col_indices]
+
+    # Letter codes at row 5
+    letter_row  = raw[5] if len(raw) > 5 else []
+    col_letters = [letter_row[j] if j < len(letter_row) else None for j in col_indices]
+
+    # Data starts at row 11 (7 + 4 for weighted, skipping both base rows)
+    base_rows_used = 4 if weighted_data else 2
+    data_start     = base_row_idx + base_rows_used
+
+    answers  = []
+    data     = []
+    sig_data = []
+
+    i = data_start
+    while i < len(raw):
+        label = raw[i][0]
+        if isinstance(label, str) and label.strip():
+            clean = label.strip()
+            # Skip base-like rows that might appear
+            if any(clean.lower().startswith(b) for b in ("base", "unweighted", "sigma")):
+                i += 1
+                continue
+            if clean.lower() == "sigma":
+                break
+            answers.append(clean)
+            pct_row = raw[i + 1] if i + 1 < len(raw) else []
+            sig_row = raw[i + 2] if i + 2 < len(raw) else []
+            row_vals = []
+            sig_vals = []
+            for j in col_indices:
+                v = pct_row[j] if j < len(pct_row) else None
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    row_vals.append(None)
+                elif isinstance(v, str) and v.strip() in ("-", "", "\xa0"):
+                    row_vals.append(None)
+                else:
+                    row_vals.append(v)
+                sv = sig_row[j] if j < len(sig_row) else None
+                sig_vals.append(sv if isinstance(sv, str) else None)
+            data.append(row_vals)
+            sig_data.append(sig_vals)
+        i += 3
+
+    return {
+        "question_wording": question_wording,
+        "columns":          col_labels,
+        "base_values":      base_values,
+        "answers":          answers,
+        "data":             data,
+        "sig_data":         sig_data,
+        "col_letters":      col_letters,
+    }
+
 def _hex_to_rgb(hex_color):
     h = hex_color.lstrip('#')
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -1353,6 +1472,44 @@ def generate_outputs(
             # ── fmt6 ─────────────────────────────────────────
             elif fmt == 'fmt6':
                 parsed = parse_fmt6_sheet(sheet_df, desired_groups, weighted_data, weighted_base=use_weighted_base)
+                if not parsed['answers']:
+                    skipped.append(sheet_label)
+                    continue
+
+                col_labels, answers, data, flags = _prep_fmt2_fmt5(
+                    parsed, row_filter, show_sig_flags)
+                if not answers:
+                    skipped.append(sheet_label)
+                    continue
+
+                if word_doc is not None:
+                    write_table_to_doc(
+                        word_doc, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, first_word,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
+                    )
+                    first_word = False
+
+                if xl_wb is not None:
+                    ws, row_num = _xl_get_sheet(xl_sheet_key)
+                    nr = _xl_write_table(
+                        ws, row_num, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, True,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
+                    )
+                    _xl_done(ws, xl_sheet_key, nr)
+
+            # ── fmt7 ─────────────────────────────────────────
+            elif fmt == 'fmt7':
+                parsed = parse_fmt7_sheet(sheet_df, desired_groups, weighted_data, weighted_base=use_weighted_base)
                 if not parsed['answers']:
                     skipped.append(sheet_label)
                     continue
