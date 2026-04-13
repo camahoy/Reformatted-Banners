@@ -1,10 +1,10 @@
 """
-engine.py — Banner Formatter core logic v2.5
+engine.py — Banner Formatter core logic v2.6
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
 
-print("ENGINE VERSION 2.5 LOADED")
+print("ENGINE VERSION 2.6 LOADED")
 
 import io
 import math
@@ -145,6 +145,19 @@ def detect_format(sheet_df):
     except (IndexError, TypeError):
         pass
 
+    # fmt7: extra group header row between question and categories
+    # Row 2=question, Row 3=group names, Row 4=categories (col1=Total), Row 7=UnweightedBase
+    try:
+        row2_col0 = raw[2][0]
+        row4_col1 = raw[4][1]
+        row7_col0 = raw[7][0] if len(raw) > 7 else None
+        if (isinstance(row2_col0, str) and len(row2_col0.strip()) > 10
+            and isinstance(row4_col1, str) and 'total' in row4_col1.lower()
+            and isinstance(row7_col0, str) and row7_col0.strip().lower().startswith('unweighted')):
+            return 'fmt7'
+    except (IndexError, TypeError):
+        pass
+
     # fmt2 / fmt3: row 3 col 1 = 'Total', row 4 = sub-labels
     try:
         row2_col0 = raw[2][0]
@@ -229,6 +242,12 @@ def scan_file(file_bytes):
                         columns.append((g.strip(), ''))
             elif fmt == 'fmt6':
                 cat_row = raw[5] if len(raw) > 5 else []
+                for j in range(1, len(cat_row)):
+                    g = cat_row[j]
+                    if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
+                        columns.append((g.strip(), ''))
+            elif fmt == 'fmt7':
+                cat_row = raw[4] if len(raw) > 4 else []
                 for j in range(1, len(cat_row)):
                     g = cat_row[j]
                     if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
@@ -949,6 +968,105 @@ def parse_fmt7_sheet(sheet_df, desired_groups=None, weighted_data=False, weighte
         "col_letters":      col_letters,
     }
 
+
+import re as _re
+
+_FMT6_TABLE_TYPES = ['Summary Grid', 'Summary - Mean', 'T2B - Summary',
+                     'B2B - Summary', 'T3B - Summary', 'HIDDEN']
+
+def classify_fmt6_sheet(wording):
+    for tt in _FMT6_TABLE_TYPES:
+        if f'[{tt}]' in wording or f"'[{tt}]" in wording:
+            key = tt.lower().replace(' ', '_').replace('-_','').replace(' -','').strip('_')
+            return key, None
+    m = _re.search(r'\[([^\[\]]+)\]', wording)
+    if m:
+        return 'entity', m.group(1).strip()
+    return 'standalone', None
+
+
+def parse_fmt6_mean(sheet_df, desired_groups=None, use_weighted_base=False):
+    raw = sheet_df.values.tolist()
+    question_wording = str(raw[3][0]).strip() if (len(raw) > 3 and raw[3][0]) else ''
+    cat_row  = raw[5] if len(raw) > 5 else []
+    all_cols = []
+    for j in range(1, len(cat_row)):
+        g = cat_row[j]
+        if isinstance(g, str) and g.strip() and g.strip() != '\xa0':
+            all_cols.append((j, g.strip()))
+    if desired_groups:
+        desired_lower = {d.lower() for d in desired_groups}
+        selected = [(j, g) for j, g in all_cols if g.lower() in desired_lower]
+    else:
+        selected = all_cols
+    col_indices = [j for j, g in selected]
+    col_labels  = [g for j, g in selected]
+    base_row  = raw[8] if len(raw) > 8 else []
+    base_vals = [base_row[j] if j < len(base_row) else None for j in col_indices]
+    answers, data = [], []
+    SKIP = {'sigma', '- column means:', '- column proportions:', 'table of contents'}
+    i = 10
+    while i < len(raw):
+        label = raw[i][0]
+        if isinstance(label, str) and label.strip():
+            clean = label.strip()
+            if clean.lower() in SKIP:
+                break
+            answers.append(clean)
+            row_vals = []
+            for j in col_indices:
+                v = raw[i][j] if j < len(raw[i]) else None
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    row_vals.append(None)
+                elif isinstance(v, str) and v.strip() in ('-', '', '\xa0'):
+                    row_vals.append(None)
+                else:
+                    row_vals.append(v)
+            data.append(row_vals)
+        i += 2
+    return {
+        'question_wording': question_wording,
+        'columns':          [(g, '') for g in col_labels],
+        'col_labels':       col_labels,
+        'base_values':      base_vals,
+        'answers':          answers,
+        'data':             data,
+        'sig_data':         [[] for _ in answers],
+        'col_letters':      [],
+        'is_mean':          True,
+    }
+
+
+def build_fmt6_entity_merge(entity_sheets, desired_groups, weighted_data, use_weighted_base):
+    TARGET = {'top 2 box', 'top 2 box (net)', 'bottom 2 box', 'bottom 2 box (net)'}
+    col_labels, base_values = [], []
+    ref_answers, merged_data = None, None
+    for sheet_idx, entity_name, sheet_df in entity_sheets:
+        parsed = parse_fmt6_sheet(sheet_df, desired_groups, weighted_data, use_weighted_base)
+        if not parsed['answers']:
+            continue
+        col_list = [g for (g, s) in parsed['columns']]
+        if ref_answers is None:
+            ref_answers = parsed['answers']
+            merged_data = [[] for _ in ref_answers]
+        ans_lookup = {a.strip().lower(): i for i, a in enumerate(parsed['answers'])}
+        for ci, col_label in enumerate(col_list):
+            col_labels.append(f"{entity_name}\n{col_label}")
+            base_values.append(parsed['base_values'][ci] if ci < len(parsed['base_values']) else None)
+            for ai, ref_ans in enumerate(ref_answers):
+                idx = ans_lookup.get(ref_ans.strip().lower())
+                val = parsed['data'][idx][ci] if (idx is not None and idx < len(parsed['data']) and ci < len(parsed['data'][idx])) else None
+                merged_data[ai].append(val)
+    if not ref_answers:
+        return None
+    filtered_a, filtered_d = [], []
+    for ai, ans in enumerate(ref_answers):
+        if any(kw in ans.strip().lower() for kw in TARGET):
+            filtered_a.append(ans.strip())
+            filtered_d.append(merged_data[ai])
+    return (col_labels, base_values, filtered_a, filtered_d) if filtered_a else None
+
+
 def _hex_to_rgb(hex_color):
     h = hex_color.lstrip('#')
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -1255,6 +1373,274 @@ def _prep_fmt2_fmt5(parsed, row_filter, show_sig_flags):
     return col_labels, answers, data, flags
 
 
+
+def parse_fmt7_sheet(sheet_df, desired_groups=None, weighted_data=False, weighted_base=None):
+    """fmt7: question at row2, group header at row3, categories at row4, weighted bases at rows 7+9."""
+    if weighted_base is None:
+        weighted_base = weighted_data
+    raw = sheet_df.values.tolist()
+    question_wording = str(raw[2][0]).strip() if (len(raw) > 2 and raw[2][0]) else ""
+    cat_row = raw[4] if len(raw) > 4 else []
+    all_cols = []
+    for j in range(1, len(cat_row)):
+        g = cat_row[j]
+        if isinstance(g, str) and g.strip() and g.strip() != "\xa0":
+            all_cols.append((j, g.strip(), ""))
+    if desired_groups is not None:
+        desired_lower = {d.lower() for d in desired_groups}
+        selected_cols = [(j, g, s) for (j, g, s) in all_cols if g.lower() in desired_lower]
+    else:
+        selected_cols = all_cols
+    col_indices = [j for (j, g, s) in selected_cols]
+    col_labels  = [(g, s) for (j, g, s) in selected_cols]
+    base_offset   = 2 if weighted_base else 0
+    base_row_idx  = 7
+    base_data_row = raw[base_row_idx + base_offset] if base_row_idx + base_offset < len(raw) else []
+    base_values   = [base_data_row[j] if j < len(base_data_row) else None for j in col_indices]
+    letter_row  = raw[5] if len(raw) > 5 else []
+    col_letters = [letter_row[j] if j < len(letter_row) else None for j in col_indices]
+    base_rows_used = 4 if weighted_data else 2
+    data_start     = base_row_idx + base_rows_used
+    answers, data, sig_data = [], [], []
+    i = data_start
+    while i < len(raw):
+        label = raw[i][0]
+        if isinstance(label, str) and label.strip():
+            clean = label.strip()
+            if any(clean.lower().startswith(b) for b in ("base", "unweighted", "sigma")):
+                i += 1
+                continue
+            answers.append(clean)
+            pct_row = raw[i + 1] if i + 1 < len(raw) else []
+            sig_row = raw[i + 2] if i + 2 < len(raw) else []
+            row_vals, sig_vals = [], []
+            for j in col_indices:
+                v = pct_row[j] if j < len(pct_row) else None
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    row_vals.append(None)
+                elif isinstance(v, str) and v.strip() in ("-", "", "\xa0"):
+                    row_vals.append(None)
+                else:
+                    row_vals.append(v)
+                sv = sig_row[j] if j < len(sig_row) else None
+                sig_vals.append(sv if isinstance(sv, str) else None)
+            data.append(row_vals)
+            sig_data.append(sig_vals)
+        i += 3
+    return {"question_wording": question_wording, "columns": col_labels,
+            "base_values": base_values, "answers": answers, "data": data,
+            "sig_data": sig_data, "col_letters": col_letters}
+
+
+def _generate_fmt6_outputs(
+    xl, file_bytes, sheet_table_configs, desired_groups,
+    output_format, excel_mode, portrait_landscape,
+    weighted_data, use_weighted_base,
+    out_merged, out_t2b, out_b2b, out_grid, out_mean, out_standalone,
+    progress_callback,
+):
+    """Handles fmt6 files with entity grouping and merged tables."""
+    skipped, errors = [], []
+    groups, order = {}, []
+    selected_indices = set()
+    for cfg in sheet_table_configs:
+        si = cfg[0] if not isinstance(cfg[0], str) else xl.sheet_names.index(cfg[0])
+        selected_indices.add(si)
+
+    for i in range(len(xl.sheet_names)):
+        if i not in selected_indices:
+            continue
+        try:
+            df  = xl.parse(i, header=None, na_values=[""])
+            raw = df.values.tolist()
+            wording = ""
+            for row_idx in [3, 2]:
+                if len(raw) > row_idx and raw[row_idx] and raw[row_idx][0]:
+                    val = str(raw[row_idx][0]).strip()
+                    if len(val) > 5 and "sample" not in val.lower() and "weight" not in val.lower():
+                        wording = val
+                        break
+            if not wording:
+                continue
+            sheet_type, entity = classify_fmt6_sheet(wording)
+            if sheet_type == "hidden":
+                continue
+            m = _re.match(r"^([A-Za-z0-9_]+)\.", wording.strip())
+            prefix = m.group(1) if m else wording[:20]
+            if prefix not in groups:
+                groups[prefix] = {
+                    "wording_base": _re.sub(r"\s*\[.*?\]\s*-?\s*", " ", wording).strip(),
+                    "entity": [], "t2b": [], "b2b": [], "t3b": [],
+                    "summary_grid": [], "summary_mean": [], "standalone": [],
+                }
+                order.append(prefix)
+            entry = (i, entity, df)
+            if sheet_type == "entity":
+                groups[prefix]["entity"].append(entry)
+            elif "t2b" in sheet_type:
+                groups[prefix]["t2b"].append(entry)
+            elif "b2b" in sheet_type:
+                groups[prefix]["b2b"].append(entry)
+            elif sheet_type == "summary_grid":
+                groups[prefix]["summary_grid"].append(entry)
+            elif "mean" in sheet_type:
+                groups[prefix]["summary_mean"].append(entry)
+            else:
+                groups[prefix]["standalone"].append(entry)
+        except Exception as e:
+            errors.append((xl.sheet_names[i], str(e)))
+
+    word_doc = None
+    if output_format in ("word", "both"):
+        try:
+            word_doc = _get_word_template(portrait_landscape)
+        except Exception:
+            word_doc = Document()
+        word_doc.styles["Normal"].font.name = "Arial"
+        word_doc.styles["Normal"].font.size = Pt(10)
+
+    xl_wb, xl_sheet_rows, xl_sheet_ctr = None, {}, [0]
+    if output_format in ("excel", "both"):
+        xl_wb = openpyxl.Workbook()
+        xl_wb.remove(xl_wb.active)
+
+    def _xl_get(label):
+        name = label[:31]
+        if excel_mode == "per_question":
+            if name not in xl_wb.sheetnames:
+                xl_wb.create_sheet(title=name)
+                xl_sheet_rows[name] = 1
+            return xl_wb[name], xl_sheet_rows.get(name, 1)
+        else:
+            xl_sheet_ctr[0] += 1
+            sname = f"{xl_sheet_ctr[0]:03d}_{name}"[:31]
+            return xl_wb.create_sheet(title=sname), 1
+
+    def _xl_done(ws, label, nr):
+        if excel_mode == "per_question":
+            xl_sheet_rows[label[:31]] = nr
+
+    first_word = [True]
+
+    def _write(q_wording, col_labels, base_values, answers, data, xl_key, is_mean=False):
+        multiple = 1 if is_mean else 100
+        if word_doc is not None:
+            if not first_word[0]:
+                word_doc.add_paragraph()
+            qp = word_doc.add_paragraph()
+            qp.style = word_doc.styles["Normal"]
+            qp.text  = q_wording
+            n_cols = len(col_labels)
+            tbl = word_doc.add_table(rows=1, cols=n_cols + 1)
+            tbl.style     = "Table Grid"
+            tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+            hdr = tbl.rows[0].cells
+            hdr[0].text = ""
+            for ci in range(n_cols):
+                base_str = prettyPrint(base_values[ci]) if ci < len(base_values) else ""
+                hdr[ci+1].text = ""
+                run = hdr[ci+1].paragraphs[0].add_run(f"{col_labels[ci]}\n(N={base_str})")
+                run.bold = True
+                hdr[ci+1].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for ri, ans in enumerate(answers):
+                rc = tbl.add_row().cells
+                rc[0].text = str(ans)
+                row_vals = data[ri] if ri < len(data) else []
+                for ci in range(n_cols):
+                    val  = row_vals[ci] if ci < len(row_vals) else None
+                    cell = rc[ci + 1]
+                    cell.text = ""
+                    if val is None or (isinstance(val, float) and math.isnan(val)):
+                        pass
+                    elif isinstance(val, str):
+                        cell.paragraphs[0].add_run(val)
+                        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    elif is_mean:
+                        cell.paragraphs[0].add_run(str(round(val, 2)))
+                        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    else:
+                        cell.paragraphs[0].add_run(f"{normal_round(round(val * 100, 3))}%")
+                        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for j in range(n_cols + 1):
+                for cell in tbl.columns[j].cells:
+                    cell.width = Inches(2.5) if j == 0 else Inches(1.4)
+                    if j > 0:
+                        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            first_word[0] = False
+
+        if xl_wb is not None:
+            ws, row_num = _xl_get(xl_key)
+            nr = _xl_write_table(ws, row_num, q_wording, col_labels,
+                                 base_values, answers, data, multiple)
+            _xl_done(ws, xl_key, nr)
+
+    total_groups = max(len(order), 1)
+    for gi, prefix in enumerate(order):
+        if progress_callback:
+            progress_callback(gi / total_groups, f"Processing {prefix}…")
+        grp    = groups[prefix]
+        xl_key = prefix[:31]
+
+        if out_merged and grp["entity"]:
+            result = build_fmt6_entity_merge(grp["entity"], desired_groups, weighted_data, use_weighted_base)
+            if result:
+                cls, bvs, ans, dat = result
+                _write(grp["wording_base"] + " [Companies T2B/B2B]", cls, bvs, ans, dat, xl_key)
+
+        type_cfg = [
+            ("t2b",          out_t2b,  False, " [T2B Summary]"),
+            ("b2b",          out_b2b,  False, " [B2B Summary]"),
+            ("summary_grid", out_grid, False, " [Summary Grid]"),
+            ("summary_mean", out_mean, True,  " [Mean]"),
+        ]
+        for key, enabled, use_mean, suffix in type_cfg:
+            if not enabled:
+                continue
+            for si, entity, df in grp[key]:
+                try:
+                    if use_mean:
+                        p = parse_fmt6_mean(df, desired_groups, use_weighted_base)
+                    elif key == "summary_grid":
+                        p = parse_fmt6_sheet(df, None, weighted_data, use_weighted_base)
+                    else:
+                        p = parse_fmt6_sheet(df, desired_groups, weighted_data, use_weighted_base)
+                    if not p["answers"]:
+                        continue
+                    cls = p.get("col_labels") or [g for g, s in p["columns"]]
+                    _write(p["question_wording"] + suffix, cls, p["base_values"],
+                           p["answers"], p["data"], xl_key, is_mean=p.get("is_mean", False))
+                except Exception as e:
+                    errors.append((xl.sheet_names[si], str(e)))
+
+        if out_standalone:
+            for si, entity, df in grp["standalone"]:
+                try:
+                    p = parse_fmt6_sheet(df, desired_groups, weighted_data, use_weighted_base)
+                    if not p["answers"]:
+                        continue
+                    cls = p.get("col_labels") or [g for g, s in p["columns"]]
+                    _write(p["question_wording"], cls, p["base_values"],
+                           p["answers"], p["data"], xl_key)
+                except Exception as e:
+                    errors.append((xl.sheet_names[si], str(e)))
+
+    if progress_callback:
+        progress_callback(1.0, "Finalizing…")
+
+    word_bytes = excel_bytes = None
+    if word_doc is not None and output_format in ("word", "both"):
+        buf = io.BytesIO()
+        word_doc.save(buf)
+        word_bytes = buf.getvalue()
+    if xl_wb is not None and output_format in ("excel", "both"):
+        buf = io.BytesIO()
+        xl_wb.save(buf)
+        excel_bytes = buf.getvalue()
+
+    return {"word_bytes": word_bytes, "excel_bytes": excel_bytes,
+            "skipped": skipped, "errors": errors}
+
+
 # ── Main generation function ─────────────────────────────────
 
 def generate_outputs(
@@ -1265,28 +1651,49 @@ def generate_outputs(
     excel_mode,
     portrait_landscape,
     weighted_data,
-    use_weighted_base=None,  # None = same as weighted_data; True/False = override base row
+    use_weighted_base=None,
     progress_callback=None,
     show_sig_flags=False,
     heatmap_scheme="None",
     heatmap_custom_start=None,
     heatmap_custom_end=None,
+    fmt6_output_merged_entity=True,
+    fmt6_output_t2b=True,
+    fmt6_output_b2b=True,
+    fmt6_output_grid=True,
+    fmt6_output_mean=False,
+    fmt6_output_standalone=True,
 ):
-    # use_weighted_base controls which base row to show in N=
-    # If None, defaults to same as weighted_data
     if use_weighted_base is None:
         use_weighted_base = weighted_data
-    """
-    Core generation function called by the Streamlit app.
-    sheet_table_configs: list of (sheet_index, row_filter) tuples.
-    The same sheet_index can appear multiple times (one per table config).
-    """
-    xl      = pd.ExcelFile(io.BytesIO(file_bytes))
-    total   = max(len(sheet_table_configs), 1)
+
+    xl    = pd.ExcelFile(io.BytesIO(file_bytes))
+    total = max(len(sheet_table_configs), 1)
+
+    # Detect fmt6-dominant file and route to dedicated handler
+    fmt6_count = 0
+    for cfg in sheet_table_configs[:10]:
+        try:
+            si  = cfg[0] if not isinstance(cfg[0], str) else xl.sheet_names.index(cfg[0])
+            df  = xl.parse(si, header=None, na_values=[''])
+            fmt = detect_format(df)
+            if fmt == 'fmt6':
+                fmt6_count += 1
+        except Exception:
+            pass
+
+    if fmt6_count >= 3:
+        return _generate_fmt6_outputs(
+            xl, file_bytes, sheet_table_configs, desired_groups,
+            output_format, excel_mode, portrait_landscape,
+            weighted_data, use_weighted_base,
+            fmt6_output_merged_entity, fmt6_output_t2b, fmt6_output_b2b,
+            fmt6_output_grid, fmt6_output_mean, fmt6_output_standalone,
+            progress_callback,
+        )
+
     skipped = []
     errors  = []
-
-    # Cache parsed sheets so we don't re-parse the same sheet multiple times
     parsed_cache = {}
 
     # Word setup
@@ -1532,6 +1939,41 @@ def generate_outputs(
                     )
                     first_word = False
 
+                if xl_wb is not None:
+                    ws, row_num = _xl_get_sheet(xl_sheet_key)
+                    nr = _xl_write_table(
+                        ws, row_num, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, True,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
+                    )
+                    _xl_done(ws, xl_sheet_key, nr)
+
+
+            # ── fmt7 ─────────────────────────────────────────
+            elif fmt == 'fmt7':
+                parsed = parse_fmt7_sheet(sheet_df, desired_groups, weighted_data, weighted_base=use_weighted_base)
+                if not parsed['answers']:
+                    skipped.append(sheet_label)
+                    continue
+                col_labels, answers, data, flags = _prep_fmt2_fmt5(parsed, row_filter, show_sig_flags)
+                if not answers:
+                    skipped.append(sheet_label)
+                    continue
+                if word_doc is not None:
+                    write_table_to_doc(
+                        word_doc, parsed['question_wording'],
+                        col_labels, parsed['base_values'],
+                        answers, data, 100, first_word,
+                        sig_flags=flags,
+                        heatmap_scheme=heatmap_scheme,
+                        heatmap_custom_start=heatmap_custom_start,
+                        heatmap_custom_end=heatmap_custom_end,
+                    )
+                    first_word = False
                 if xl_wb is not None:
                     ws, row_num = _xl_get_sheet(xl_sheet_key)
                     nr = _xl_write_table(
