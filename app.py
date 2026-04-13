@@ -108,7 +108,7 @@ if not check_password():
 st.markdown("""
 <div class="app-header">
     <h1>📊 Banner Formatter</h1>
-    <p>Upload · Configure · Download Word or Excel output &nbsp;·&nbsp; <span style="opacity:0.4;font-size:0.75rem">v2.2</span></p>
+    <p>Upload · Configure · Download Word or Excel output &nbsp;·&nbsp; <span style="opacity:0.4;font-size:0.75rem">v2.5</span></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -140,6 +140,12 @@ heatmap_scheme       = "None"
 heatmap_custom_start = None
 heatmap_custom_end   = None
 use_weighted_base    = False
+fmt6_merged          = True
+fmt6_t2b             = True
+fmt6_b2b             = True
+fmt6_grid            = True
+fmt6_mean            = False
+fmt6_standalone      = True
 
 # ── Mode toggle ───────────────────────────────────────────────
 st.markdown("""
@@ -488,6 +494,12 @@ if uploaded:
             q_grps  = get_question_groups(metas)
             sel_idx = [m["index"] for m in metas if m["fmt"] != "error"]
 
+            # Detect fmt6-dominant file (survey with entity loops)
+            fmt_counts = {}
+            for m in metas:
+                fmt_counts[m["fmt"]] = fmt_counts.get(m["fmt"], 0) + 1
+            is_fmt6_file = fmt_counts.get("fmt6", 0) > fmt_counts.get("fmt2", 0)
+
             st.session_state.update({
                 "file_bytes":         file_bytes_new,
                 "file_name":          uploaded.name,
@@ -497,8 +509,9 @@ if uploaded:
                 "q_groups":           q_grps,
                 "selected_indices":   sel_idx,
                 "results":            None,
-                "group_rows_cache":   {},   # loaded on demand when expander opens
+                "group_rows_cache":   {},
                 "table_configs":      {},
+                "is_fmt6_file":       is_fmt6_file,
             })
 
 # ── STEP 2: Sheet review ──────────────────────────────────────
@@ -597,9 +610,21 @@ if st.session_state.get("q_groups"):
         with vf4:
             heatmap_custom_end   = st.color_picker("End color (high)", "#1D4ED8")
 
-    st.divider()
+    # fmt6 table type toggles (only shown for fmt6 files)
+    is_fmt6 = st.session_state.get("is_fmt6_file", False)
+    fmt6_merged = fmt6_t2b = fmt6_b2b = fmt6_grid = fmt6_mean = fmt6_standalone = True
+    if is_fmt6:
+        st.markdown("#### 📊 Table types to include")
+        st.caption("This file uses the survey format with entity loops. Select which table types to output.")
+        tc1, tc2, tc3, tc4, tc5, tc6 = st.columns(6)
+        fmt6_merged     = tc1.toggle("Entity merge",  value=True,  help="Companies as rows, T2B+B2B")
+        fmt6_t2b        = tc2.toggle("T2B Summary",   value=True)
+        fmt6_b2b        = tc3.toggle("B2B Summary",   value=True)
+        fmt6_grid       = tc4.toggle("Summary Grid",  value=True)
+        fmt6_mean       = tc5.toggle("Mean",          value=False)
+        fmt6_standalone = tc6.toggle("Standalone",    value=True)
 
-    # Columns
+    st.divider()
     st.markdown("#### 🗂 Columns to include")
     st.caption("Applies to Standard and Top Box sheets. Grid tables use their brand columns automatically.")
 
@@ -733,24 +758,29 @@ if (
     </div>
     """, unsafe_allow_html=True)
 
-    # Build (sheet_index, row_filter, group_prefix, table_label) tuples
-    # group_prefix is used as the Excel sheet name in per_question mode
-    # so all sub-questions in a group land on the same sheet
+    # Build sheet_table_configs
     tc = st.session_state["table_configs"]
     sheet_table_configs = []
-    for grp in st.session_state["q_groups"]:
-        prefix  = grp["prefix"]
-        configs = tc.get(prefix, [{"label":"All rows","rows":"all"}])
-        for cfg in configs:
-            for m in grp["sheets"]:
-                if m["index"] not in st.session_state.get("selected_indices", []):
-                    continue
-                sheet_table_configs.append((
-                    m["index"],
-                    cfg["rows"],
-                    prefix,
-                    cfg["label"],
-                ))
+
+    if st.session_state.get("is_fmt6_file"):
+        # fmt6: pass all selected sheet indices — engine groups them internally
+        for m in st.session_state["sheet_metas"]:
+            if m["fmt"] not in ("fmt1", "error"):
+                sheet_table_configs.append((m["index"], "all", m["question_wording"][:20], "All rows"))
+    else:
+        for grp in st.session_state["q_groups"]:
+            prefix  = grp["prefix"]
+            configs = tc.get(prefix, [{"label":"All rows","rows":"all"}])
+            for cfg in configs:
+                for m in grp["sheets"]:
+                    if m["index"] not in st.session_state.get("selected_indices", []):
+                        continue
+                    sheet_table_configs.append((
+                        m["index"],
+                        cfg["rows"],
+                        prefix,
+                        cfg["label"],
+                    ))
 
     n_tables = len(sheet_table_configs)
     st.info(f"Ready to generate **{n_tables} table(s)** with **{len(selected_cols)} column(s)**.")
@@ -763,19 +793,25 @@ if (
 
         with st.spinner(""):
             results = generate_outputs(
-                file_bytes             = st.session_state["file_bytes"],
-                sheet_table_configs    = sheet_table_configs,
-                desired_groups         = selected_cols,
-                output_format          = output_format,
-                excel_mode             = excel_mode,
-                portrait_landscape     = portrait_landscape,
-                weighted_data          = weighted_data,
-                use_weighted_base      = use_weighted_base,
-                progress_callback      = upd,
-                show_sig_flags         = show_sig_flags,
-                heatmap_scheme         = heatmap_scheme,
-                heatmap_custom_start   = heatmap_custom_start,
-                heatmap_custom_end     = heatmap_custom_end,
+                file_bytes                = st.session_state["file_bytes"],
+                sheet_table_configs       = sheet_table_configs,
+                desired_groups            = selected_cols,
+                output_format             = output_format,
+                excel_mode                = excel_mode,
+                portrait_landscape        = portrait_landscape,
+                weighted_data             = weighted_data,
+                use_weighted_base         = use_weighted_base,
+                progress_callback         = upd,
+                show_sig_flags            = show_sig_flags,
+                heatmap_scheme            = heatmap_scheme,
+                heatmap_custom_start      = heatmap_custom_start,
+                heatmap_custom_end        = heatmap_custom_end,
+                fmt6_output_merged_entity = fmt6_merged,
+                fmt6_output_t2b           = fmt6_t2b,
+                fmt6_output_b2b           = fmt6_b2b,
+                fmt6_output_grid          = fmt6_grid,
+                fmt6_output_mean          = fmt6_mean,
+                fmt6_output_standalone    = fmt6_standalone,
             )
         bar.progress(1.0, text="Done!")
         st.session_state["results"] = results
