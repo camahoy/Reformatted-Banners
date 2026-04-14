@@ -1,10 +1,10 @@
 """
-engine.py — Banner Formatter core logic v2.6
+engine.py — Banner Formatter core logic v2.7
 All parsing, detection, and output writing lives here.
 The Streamlit app (app.py) calls these functions directly.
 """
 
-print("ENGINE VERSION 2.6 LOADED")
+print("ENGINE VERSION 2.7 LOADED")
 
 import io
 import math
@@ -975,13 +975,34 @@ _FMT6_TABLE_TYPES = ['Summary Grid', 'Summary - Mean', 'T2B - Summary',
                      'B2B - Summary', 'T3B - Summary', 'HIDDEN']
 
 def classify_fmt6_sheet(wording):
-    for tt in _FMT6_TABLE_TYPES:
-        if f'[{tt}]' in wording or f"'[{tt}]" in wording:
-            key = tt.lower().replace(' ', '_').replace('-_','').replace(' -','').strip('_')
-            return key, None
-    m = _re.search(r'\[([^\[\]]+)\]', wording)
-    if m:
-        return 'entity', m.group(1).strip()
+    # Normalize: remove apostrophes before brackets, lowercase for matching
+    w = wording.replace("'[", "[")
+
+    # Check for table type keywords anywhere in the wording
+    table_type_map = [
+        ('summary_grid',  ['summary grid', 'grid - summary', 'grid summary']),
+        ('summary_mean',  ['summary - mean', "summary - mean'"]),
+        ('t2b',           ['t2b - summary', "t2b - 'summary", "t2b - summary'"]),
+        ('b2b',           ['b2b - summary', "b2b - 'summary", "b2b - summary'"]),
+        ('t3b',           ['t3b - summary', "t3b - 'summary"]),
+        ('hidden',        ['hidden']),
+    ]
+    wl = w.lower()
+    for key, patterns in table_type_map:
+        for pat in patterns:
+            if pat in wl:
+                return key, None
+
+    # Entity sheet: extract first bracketed name that is NOT a table type or statement
+    # For compound wordings like [Google] - [Summary Grid], find entity first
+    matches = _re.findall(r'\[([^\[\]]+)\]', w)
+    for m in matches:
+        ml = m.strip().lower()
+        # Skip if this bracket contains a table type keyword
+        is_table = any(pat in ml for patterns in [p for _, p in table_type_map] for pat in patterns)
+        if not is_table and len(ml) < 60:
+            return 'entity', m.strip()
+
     return 'standalone', None
 
 
