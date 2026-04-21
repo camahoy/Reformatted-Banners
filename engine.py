@@ -61,6 +61,25 @@ def sum2(listSum):
     return total
 
 
+def _coerce_val(v):
+    """Convert a cell value to float if possible, else None for blanks, else as-is."""
+    if v is None:
+        return None
+    if isinstance(v, float):
+        return None if math.isnan(v) else v
+    if isinstance(v, int):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s in ('', '-', '\xa0', '\u00a0'):
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return v  # return as string (e.g. sig letters)
+    return v
+
+
 # ── Format detection ─────────────────────────────────────────
 
 def detect_format(sheet_df):
@@ -412,7 +431,7 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False, weighte
     base_values   = []
     if base_row_idx is not None:
         base_data_row = raw[base_row_idx + base_offset] if base_row_idx + base_offset < len(raw) else []
-        base_values   = [base_data_row[j] if j < len(base_data_row) else None for j in col_indices]
+        base_values   = [_coerce_val(base_data_row[j] if j < len(base_data_row) else None) for j in col_indices]
 
     base_rows_used = 4 if weighted_data else 2
     data_start = (base_row_idx + base_rows_used) if base_row_idx is not None else 9
@@ -434,7 +453,7 @@ def parse_fmt2_sheet(sheet_df, desired_groups=None, weighted_data=False, weighte
             answers.append(label_clean)
             pct_row = raw[i + 1] if i + 1 < len(raw) else []
             sig_row = raw[i + 2] if i + 2 < len(raw) else []
-            row_vals = [pct_row[j] if j < len(pct_row) else None for j in col_indices]
+            row_vals = [_coerce_val(pct_row[j] if j < len(pct_row) else None) for j in col_indices]
             sig_vals = [sig_row[j]  if j < len(sig_row)  else None for j in col_indices]
             data.append(row_vals)
             sig_data.append(sig_vals)
@@ -640,9 +659,7 @@ def parse_fmt5_sheet(sheet_df, desired_groups=None, weighted_data=False, weighte
             row_vals, sig_vals = [], []
             for j in col_indices:
                 v = pct_row[j] if j < len(pct_row) else None
-                if v is None or (isinstance(v, float) and math.isnan(v)): row_vals.append(None)
-                elif isinstance(v, str) and v.strip() in ('-', '', '\xa0'): row_vals.append(None)
-                else: row_vals.append(v)
+                row_vals.append(_coerce_val(v))
                 sv = sig_row[j] if j < len(sig_row) else None
                 sig_vals.append(sv if isinstance(sv, str) else None)
             data.append(row_vals)
